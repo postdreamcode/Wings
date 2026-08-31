@@ -41,9 +41,9 @@ static uint8_t g_faultMask = 0;
 // levels then the reference is not toggling, the gap test would be meaningless,
 // and attaches are refused until it recovers.
 static bool g_refOk = false;
-static bool g_refSawHigh = false;
-static bool g_refSawLow = false;
-static uint32_t g_refWindowMs = 0;
+static bool g_cfgOk = false;      // peripheral set up; latched, never re-earned
+static uint32_t g_refLastHighMs = 0;
+static uint32_t g_refLastLowMs = 0;
 static const uint32_t SD_REF_WINDOW_MS = 1000;
 
 // Guards a pad handover. The window is a couple of register writes long; an
@@ -295,10 +295,23 @@ bool sdBegin() {
   if (!channelConfig(SD_REF_CHANNEL, usToDuty(SD_REF_US))) cfgOk = false;
   refPadInit();
 
-  g_refOk = cfgOk && refWaitLatched(SD_LIVE_TIMEOUT_MS) && refProveAlive();
-  g_refSawHigh = false;
-  g_refSawLow = false;
-  g_refWindowMs = millis();
+  g_cfgOk = cfgOk;
+  const bool alive = cfgOk && refWaitLatched(SD_LIVE_TIMEOUT_MS) && refProveAlive();
+
+  /*
+    Seed the staleness stamps to match what was actually proven, rather than
+    unconditionally to now.
+
+    On success both levels have genuinely just been observed. On failure the
+    stamps must read STALE, or a reference stuck at one level would count as
+    "recently toggling" for the whole first window and refOk would come up true
+    on its own. Unsigned wrap makes the subtraction safe even when millis() is
+    still smaller than the window.
+  */
+  const uint32_t seed = alive ? millis() : (millis() - SD_REF_WINDOW_MS - 1);
+  g_refLastHighMs = seed;
+  g_refLastLowMs = seed;
+  g_refOk = alive;
 
   g_lastWriteMs = millis();
   g_begun = true;
@@ -607,29 +620,39 @@ bool sdAllSettled() {
 }
 
 /*
-  Accumulates both levels of the reference and re-verifies its duty once per
-  window. A reference that has stopped toggling makes the gap test meaningless,
-  so that is treated as a loss of the safety property, not a cosmetic fault.
+  Holds the reference trustworthy only while BOTH levels have been seen recently
+  and the channel is still emitting the expected duty. A reference that has
+  stopped toggling makes the gap test meaningless, so that is a loss of the
+  safety property, not a cosmetic fault.
 
-  Must be called as often as possible, and the window is measured in TIME rather
-  than in calls. An earlier version counted calls and was invoked once per frame,
-  which aliased: the reference is HIGH for only 2500 us of every 20000, so a
-  sample taken once per 20 ms frame lands at nearly the same phase every time and
-  can miss the HIGH indefinitely. On hardware that declared a perfectly healthy
-  reference dead and refused every attach.
+  Must be called as often as possible. Two things were got wrong here before:
+
+  - It was called once per frame, from after the cadence gate in sdService. That
+    aliased: the reference is HIGH for only 2500 us of every 20000, so a sample
+    taken once per 20 ms frame lands at nearly the same phase every time and can
+    miss the HIGH indefinitely. On hardware it declared a healthy reference dead
+    and refused every attach.
+  - It then used a tumbling window, which meant the window straddling a failure
+    still contained pre-failure evidence and reported healthy. Worst-case
+    detection was nearly two windows for no benefit.
+
+  Staleness instead of a window: detection latency is exactly SD_REF_WINDOW_MS.
+  That latency is acceptable because refOk is the secondary gate — every attach
+  independently waits for a real pulse edge and refuses on timeout, so a dead
+  reference is caught at the point of use regardless of what this thinks.
 */
 static void superviseRef() {
-  if (gpio_get_level((gpio_num_t)PIN_LEDC_BIND)) g_refSawHigh = true;
-  else g_refSawLow = true;
-
   const uint32_t now = millis();
-  if ((uint32_t)(now - g_refWindowMs) < SD_REF_WINDOW_MS) return;
-  g_refWindowMs = now;
+  if (gpio_get_level((gpio_num_t)PIN_LEDC_BIND)) g_refLastHighMs = now;
+  else g_refLastLowMs = now;
 
-  g_refOk = g_refSawHigh && g_refSawLow &&
-            (liveDuty(SD_REF_CHANNEL) == usToDuty(SD_REF_US));
-  g_refSawHigh = false;
-  g_refSawLow = false;
+  // Config failure is latched: a pad that happens to toggle must not be able to
+  // earn back trust that setup never established.
+  if (!g_cfgOk) { g_refOk = false; return; }
+
+  const bool toggling = (uint32_t)(now - g_refLastHighMs) < SD_REF_WINDOW_MS &&
+                        (uint32_t)(now - g_refLastLowMs) < SD_REF_WINDOW_MS;
+  g_refOk = toggling && (liveDuty(SD_REF_CHANNEL) == usToDuty(SD_REF_US));
 }
 
 /*
