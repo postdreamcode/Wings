@@ -1,0 +1,18 @@
+# PlatformIO build output, any project in the tree (firmware, padtest, future rigs)
+.pio/
+firmware/.vscode/.browse.c_edb*
+
+# Flutter (also covered under app/.gitignore)
+app/build/
+app/.dart_tool/
+
+# Source snapshot archives. Superseded by git history; kept on disk as the only
+# record of the 0.2.49 / 0.2.50 states, but not worth 63 MB of repo.
+wings-esp32-*-src.zip
+wings-fw-*-src.zip
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
