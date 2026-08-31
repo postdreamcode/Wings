@@ -50,7 +50,10 @@ static const char* const SERVO_NAMES[NUM_SERVOS] = {
 #define PIN_RXB6      6   // Master only
 #define PIN_ROLE      7   // INPUT_PULLUP: HIGH=Master, GND=Slave
 #define PIN_STATUS_LED 9  // spare (avoid GPIO8 — reserved as Elbow2 fallback)
-#define PIN_LEDC_BIND  21 // unused pad: start lastcmd PWM here, then matrix servo pin
+// Permanent phase reference. servo_driver keeps a spare LEDC channel on this pad
+// at SERVO_ABS_MAX and reads it to find the frame's idle gap. Not a scratch pad:
+// nothing else may route to it, and its pulse must stay wider than any servo's.
+#define PIN_LEDC_BIND  21
 
 static const uint8_t SERVO_PINS[NUM_SERVOS] = {
   PIN_WRIST2, PIN_WRIST1, PIN_ELBOW2, PIN_ELBOW1, PIN_SHOULDER
