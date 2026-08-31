@@ -310,6 +310,14 @@ void abortPath() {
   g_flapOn = false;
   g_flapPending = false;
   g_armSeqOn = false;
+  /*
+    Derived, never asserted. startRunMotion sets g_armed optimistically before the
+    first stage attaches, so an aborted kick would otherwise report ARMED with
+    nothing live. Equally, if a release was refused a pad is still driving and
+    reporting disarmed would be the more dangerous lie. Callers that then release
+    (STOP, DISARM) re-derive afterwards.
+  */
+  g_armed = (sdAttachMask() != 0);
 }
 
 static bool chAttached(uint8_t ch) { return sdAttached(ch); }
@@ -533,7 +541,8 @@ struct TraceRec {
   uint8_t  padWasHigh;  // pad level sampled before the transition
   uint8_t  ctx;         // low nibble = path id, high nibble = stage + 1
   int16_t  us;          // commanded value, or elapsed ms for TR_DONE
-  int16_t  detail;      // ATTACH: first-pulse fragment us, 0 = landed in the gap
+  int16_t  detail;      // ATTACH: 0 — the driver only hands over in the idle gap
+                        // REFUSE: SdResult the driver returned
                         // DETACH: settle dwell remaining ms, -1 = no group hold
                         // JUMP:   step size us
                         // DONE:   ramp duration ms
@@ -545,10 +554,10 @@ static const uint16_t TRACE_N = (uint16_t)(sizeof(g_trace) / sizeof(g_trace[0]))
 static uint16_t g_traceHead = 0;
 static uint32_t g_traceTotal = 0;
 
-// A short first pulse is the event this whole exercise exists to catch, and the
-// main ring holds only about a dozen moves. Keeping those rows in a separate
-// list means ordinary traffic — including a recovery move after a wig-out —
-// cannot scroll the evidence away.
+// A refused handover means a stage did not start, and the main ring holds only
+// about a dozen moves. Keeping those rows in a separate list means ordinary
+// traffic — including whatever was commanded next — cannot scroll the evidence
+// away.
 static TraceRec g_slam[8];
 static const uint8_t SLAM_N = (uint8_t)(sizeof(g_slam) / sizeof(g_slam[0]));
 static uint8_t  g_slamHead = 0;
@@ -681,7 +690,16 @@ static void adoptPrepared(uint8_t ch) {
 
 static bool attachAtUs(uint8_t i, int us) {
   if (i >= NUM_SERVOS) return false;
-  if (sdAttached(i)) return true;
+  if (sdAttached(i)) {
+    /*
+      Already live, which now only happens after a REFUSED release. Callers such as
+      attachArmClosed have already written their intended position into g_actual, so
+      adopt what the driver actually emitted instead: the horn is wherever it was
+      left, not at taught closed, and g_actual is persisted as lastcmd.
+    */
+    g_actual[i] = sdWritten(i);
+    return true;
+  }
 
   const uint8_t wasHigh = gpio_get_level((gpio_num_t)SERVO_PINS[i]) ? 1 : 0;
   const SdResult r = sdAttachNow(i, constrain(us, SERVO_ABS_MIN, SERVO_ABS_MAX));
@@ -725,8 +743,16 @@ static bool attachStageTogether(int g) {
   }
   if (n == 0) return true;
 
-  // One latch wait for the stage rather than one per servo: the channels share a
-  // timer, so they all go live on the same frame.
+  /*
+    One latch wait for the stage rather than one per servo: the channels share a
+    timer, so they all go live on the same frame. Normally one frame, ~20 ms.
+
+    Spun without yielding on purpose. The duty register is copied by hardware at
+    the frame boundary, so nothing here needs sdService to run, and yielding would
+    widen the window in which a BLE motion command — still handled on the NimBLE
+    task, on the other core — could land between this prepare and the handover
+    below. That race closes when the command sources are queued onto the loop task.
+  */
   const uint32_t t0 = millis();
   for (;;) {
     bool live = true;
@@ -1093,7 +1119,21 @@ static void kickGroup() {
     // RUN open/close: the whole stage goes live on one frame. Staggering was a
     // jerk plus ~300 ms sat on the first raise before the others moved.
     if (!g_forceDwell) {
-      if (attachStageTogether(g_group)) g_groupAttachIdx = groupCount(g_group);
+      if (!attachStageTogether(g_group)) {
+        /*
+          All-or-nothing, and that has to mean abort rather than retry one at a
+          time. Nothing was routed here, so there is no pad to release. Falling
+          back to the staggered path would attach whichever channels happened to
+          succeed and leave the stage half live — and a half-attached stage can
+          never report arrival, because the ramp only writes attached channels.
+          The wing would sit parked mid-pose with pads driving until STOP.
+        */
+        Serial.printf("STAGE %d refused as a unit — path aborted\n", (int)g_group);
+        detachGroup(g_group);   // no-op unless a previous stage left something
+        abortPath();
+        return;
+      }
+      g_groupAttachIdx = groupCount(g_group);
       g_lastAttachMs = millis();
     } else {
       attachNextInGroup();
@@ -1122,16 +1162,21 @@ static void serviceGroup() {
   }
 
   /*
-    A stage that attached nothing must not sit here forever.
+    EVERY member of a stage has to be live before the stage may run. Partial is
+    not a degraded mode, it is a trap: serviceCosineRamp only writes attached
+    channels, so an unattached member's g_actual never reaches its target,
+    groupArrived can never become true, and the path would wait here forever with
+    the attached pads still driving. Release what did attach, then abort.
 
-    serviceCosineRamp only writes attached channels, so with none attached g_actual
-    never moves, groupArrived never becomes true, and the path waits below with the
-    wing parked mid-pose until someone presses STOP. Refusing the move outright is
-    the honest outcome, and it leaves no pad pulsing.
+    This covers the staggered (D/home) path too, which attaches across ticks and
+    only reaches here once it has tried every member.
   */
-  if (stageAttachedCount(g_group) == 0) {
-    Serial.printf("STAGE %d attached nothing — path aborted\n", (int)g_group);
+  const uint8_t live = stageAttachedCount(g_group);
+  if (live != groupCount(g_group)) {
+    Serial.printf("STAGE %d only %u of %u attached — releasing and aborting\n",
+                  (int)g_group, (unsigned)live, (unsigned)groupCount(g_group));
     traceAdd(TR_REFUSE, TR_NO_CH, 0, g_group, (int)SD_NOT_PREPARED);
+    detachGroup(g_group);
     abortPath();
     return;
   }
@@ -1518,16 +1563,36 @@ static int flapStepDest(uint8_t ch) {
   return flapDestUs(ch, g_flapStep);
 }
 
-static void kickFlapStep() {
+/*
+  A flap needs BOTH hugs live. With only one attached the stroke waits on a channel
+  that will never move, and g_flapOn blocks the idle-detach that would otherwise
+  release the other pad — so the remaining hug sits driving until STOP. Same trap
+  as a partially attached stage, so the same answer: release and stop.
+*/
+static void abortFlap() {
+  g_flapOn = false;
+  g_flapPending = false;
+  g_flapPreamble = false;
+  g_flapHome = false;
+  g_jogMask = 0;
+  detachOne(CH_ELBOW2);
+  detachOne(CH_WRIST2);
+  g_armed = (sdAttachMask() != 0);
+  Serial.println(F("FLAP aborted — a hug would not attach"));
+}
+
+// attachOne already returns true when the channel is live, so this both attaches
+// and confirms.
+static bool kickFlapStep() {
   g_speed = SPD_HALF;
-  if (!chAttached(CH_ELBOW2)) attachOne(CH_ELBOW2);
-  if (!chAttached(CH_WRIST2)) attachOne(CH_WRIST2);
+  if (!attachOne(CH_ELBOW2) || !attachOne(CH_WRIST2)) return false;
   g_target[CH_ELBOW2] = flapStepDest(CH_ELBOW2);
   g_target[CH_WRIST2] = g_actual[CH_WRIST2];
   if (chNeedsMove(CH_ELBOW2)) startJogEase(CH_ELBOW2);
   g_flapWristGo = false;
   g_flapWristAt = millis() + (unsigned long)SEQ_FLAP_WRIST_LAG_MS;
   g_flapHoldUntil = 0;
+  return true;
 }
 
 static void finishFlap() {
@@ -1556,7 +1621,7 @@ static void beginFlap() {
                 SEQ_FLAP_DEG, flapDeltaUs(),
                 (unsigned)SEQ_FLAP_CYCLES,
                 (unsigned)SEQ_FLAP_WRIST_LAG_MS);
-  kickFlapStep();
+  if (!kickFlapStep()) abortFlap();
 }
 
 static void serviceFlap() {
@@ -1565,7 +1630,7 @@ static void serviceFlap() {
   if (!g_flapWristGo && now >= g_flapWristAt) {
     g_flapWristGo = true;
     g_target[CH_WRIST2] = flapStepDest(CH_WRIST2);
-    if (!chAttached(CH_WRIST2)) attachOne(CH_WRIST2);
+    if (!attachOne(CH_WRIST2)) { abortFlap(); return; }
     if (chNeedsMove(CH_WRIST2)) startJogEase(CH_WRIST2);
   }
   if (!g_flapWristGo) return;
@@ -1583,7 +1648,7 @@ static void serviceFlap() {
     g_flapPreamble = false;
     g_flapCycle = 0;
     g_flapStep = 0;
-    kickFlapStep();
+    if (!kickFlapStep()) abortFlap();
     return;
   }
   if (g_flapHome) {
@@ -1594,22 +1659,22 @@ static void serviceFlap() {
   if (g_flapStep == 0) {
     if (g_flapCycle >= SEQ_FLAP_CYCLES) {
       g_flapHome = true;
-      kickFlapStep();
+      if (!kickFlapStep()) abortFlap();
       return;
     }
     g_flapStep = 1;
-    kickFlapStep();
+    if (!kickFlapStep()) abortFlap();
     return;
   }
 
   g_flapCycle++;
   if (g_flapCycle >= SEQ_FLAP_CYCLES) {
     g_flapHome = true;
-    kickFlapStep();
+    if (!kickFlapStep()) abortFlap();
     return;
   }
   g_flapStep = 0;
-  kickFlapStep();
+  if (!kickFlapStep()) abortFlap();
 }
 
 void startSequence() {
@@ -1693,8 +1758,12 @@ static void serviceSetupIdle() {
 */
 static void serviceLastCmdSave() {
   if (!g_lastCmdDirty) return;
-  if (g_runMotion || g_rampOn || g_flapOn || g_armSeqOn) return;
-  if (g_jogMask != 0 || sdAttachMask() != 0) return;
+  // No pad live means there is nothing for a flash write to perturb. The path
+  // flags additionally suppress it BETWEEN stages, where the mask is briefly zero
+  // but the move is not over — that mid-path window is what used to put an NVS
+  // write inside the motion path.
+  if (sdAttachMask() != 0) return;
+  if (g_runMotion || g_flapOn || g_armSeqOn) return;
   g_lastCmdDirty = false;
   storeSaveLastCmd();
 }

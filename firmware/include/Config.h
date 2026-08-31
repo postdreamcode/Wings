@@ -69,12 +69,14 @@ static const uint8_t SERVO_PINS[NUM_SERVOS] = {
 // ---------- Motion ----------
 // Pose/flap ramps: cosine ease, open/close=full, hug=half, D=quarter.
 // BRAKE READY after attach→closed→detach on all 5 (gates A/B/C).
-// ARM: taught CLOSED only. Duty is live on BIND and ledcRead-checked
-// before the servo pad is connected. ledcSetup starts at duty 0 — never
-// matrix until the closed duty reads back. gpio_matrix_out enable-window
-// is latched HIGH at boot, detach, and connect (raises: LOW = slam
-// open). Never pinMode OUTPUT,
-// gpio_reset_pin, or ledcAttachPin on a servo GPIO.
+// ARM: taught CLOSED only.
+//
+// Nothing outside servo_driver.cpp may touch a servo pad, an LEDC register or the
+// GPIO matrix. The driver connects only inside the frame's idle gap, verifies the
+// duty is genuinely live first, rests released pads at 0 V, and refuses rather
+// than connecting when it cannot prove the frame is idle. The old latch-HIGH
+// workaround is gone by construction: pads rest LOW with a pulldown, so there is
+// no floating decay through the logic threshold to connect into.
 #define RAMP_STEP_US      20
 #define RAMP_STEP_MIN_US  10   // LEDC 12-bit ≈ 5 µs/count; 1 µs steps only buzz
 #define RAMP_INTERVAL_MS  8
