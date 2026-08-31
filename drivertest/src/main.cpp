@@ -70,6 +70,10 @@ static bool parkReady() {
 // a truncation, which is the fault this driver exists to prevent.
 static const int TRUNCATION_FLOOR_US = 1400;
 
+// Kept so the summary can distinguish "sdBegin failed" from "sdBegin succeeded
+// and supervision later marked the reference dead" — very different faults.
+static bool g_beginOk = false, g_refOkAtBoot = false;
+
 static uint32_t g_cycles = 0, g_short = 0, g_refusals = 0, g_detachFail = 0;
 static uint32_t g_minFirst = 0xFFFFFFFF, g_maxFirst = 0;
 
@@ -136,8 +140,10 @@ static void phaseRefusals() {
   expect("attach bad channel", sdAttach(NUM_SERVOS), SD_BAD_CH);
 
   const uint8_t group[2] = { CH, (uint8_t)NUM_SERVOS };
-  expect("group with one bad channel", sdAttachGroup(group, 2), SD_BAD_CH);
   expect("group of zero", sdAttachGroup(group, 0), SD_BAD_CH);
+  // Group validation returns on the first fault it finds, and ch0 is unprepared
+  // here, so this tests "a member is not ready" rather than the bad index.
+  expect("group with unready member", sdAttachGroup(group, 2), SD_NOT_PREPARED);
 
   // Prepared but the duty has not latched yet: attaching now would emit the
   // channel's PREVIOUS duty as the servo's first pulse.
@@ -153,6 +159,14 @@ static void phaseRefusals() {
   } else {
     Serial.println(F("  (duty already live, latch race not observable this run)"));
   }
+
+  // Now that ch0 is prepared and live, a bad index is the ONLY remaining fault —
+  // which is the case that actually proves index validation, rather than being
+  // masked by an unready member.
+  const uint32_t tw2 = millis();
+  while (!sdDutyLive(CH) && (uint32_t)(millis() - tw2) < SD_LIVE_TIMEOUT_MS) sdService();
+  Serial.printf("  ch0 prepared and live=%d\n", sdDutyLive(CH) ? 1 : 0);
+  expect("bad index, everything else ready", sdAttachGroup(group, 2), SD_BAD_CH);
 
   bailIfAttached("phase A");
   Serial.println(F("--- A done ---"));
@@ -370,8 +384,12 @@ static void report() {
     Serial.printf("first pulse range  : %lu..%lu us (prepared %d)\n",
                   (unsigned long)g_minFirst, (unsigned long)g_maxFirst, g_parkUs);
   }
-  Serial.printf("attachMask=0x%02X faultMask=0x%02X refOk=%d\n",
+  Serial.printf("at boot: sdBegin=%d refOk=%d\n", g_beginOk ? 1 : 0, g_refOkAtBoot ? 1 : 0);
+  Serial.printf("now    : attachMask=0x%02X faultMask=0x%02X refOk=%d\n",
                 sdAttachMask(), sdFaultMask(), sdRefOk() ? 1 : 0);
+  if (g_refOkAtBoot && !sdRefOk()) {
+    Serial.println(F("reference was alive at boot and has since been marked dead"));
+  }
   Serial.println(F("========================================="));
 }
 
@@ -435,6 +453,8 @@ void setup() {
                 CH, SERVO_NAMES[CH], SERVO_PINS[CH], PIN_LEDC_BIND);
 
   const bool ok = sdBegin();
+  g_beginOk = ok;
+  g_refOkAtBoot = sdRefOk();
   Serial.printf("sdBegin()=%d sdRefOk()=%d\n", ok ? 1 : 0, sdRefOk() ? 1 : 0);
   if (!ok) {
     Serial.println(F("*** driver refused to start: nothing can attach ***"));

@@ -43,8 +43,8 @@ static uint8_t g_faultMask = 0;
 static bool g_refOk = false;
 static bool g_refSawHigh = false;
 static bool g_refSawLow = false;
-static uint16_t g_refTicks = 0;
-static const uint16_t SD_REF_WINDOW_TICKS = 50;   // ~1 s at one tick per frame
+static uint32_t g_refWindowMs = 0;
+static const uint32_t SD_REF_WINDOW_MS = 1000;
 
 // Guards a pad handover. The window is a couple of register writes long; an
 // interrupt landing between them is what leaves a pad half-owned.
@@ -169,8 +169,26 @@ static void refPadInit() {
   gpio_matrix_out(PIN_LEDC_BIND, ledcSig(SD_REF_CHANNEL), false, false);
 }
 
+/*
+  Waits for the reference duty to reach duty_rd, i.e. to actually be emitted.
+
+  A duty write does not take effect until the frame latches, so anything that
+  checks the live duty immediately after configuring the channel is asking a
+  question the hardware cannot yet answer. refProveAlive did exactly that and so
+  failed on every boot, which left sdBegin returning false and every attach
+  refused. Boot-time only, bounded, and one frame is usually enough.
+*/
+static bool refWaitLatched(uint32_t timeoutMs) {
+  const uint32_t t0 = millis();
+  while (liveDuty(SD_REF_CHANNEL) != usToDuty(SD_REF_US)) {
+    if ((uint32_t)(millis() - t0) > timeoutMs) return false;
+    delay(1);
+  }
+  return true;
+}
+
 // Proves the reference actually toggles, rather than assuming it. Boot-time
-// only: costs a couple of frames.
+// only: costs a couple of frames. Assumes the duty has already latched.
 static bool refProveAlive() {
   if (liveDuty(SD_REF_CHANNEL) != usToDuty(SD_REF_US)) return false;
   bool sawHigh = false, sawLow = false;
@@ -277,10 +295,10 @@ bool sdBegin() {
   if (!channelConfig(SD_REF_CHANNEL, usToDuty(SD_REF_US))) cfgOk = false;
   refPadInit();
 
-  g_refOk = cfgOk && refProveAlive();
+  g_refOk = cfgOk && refWaitLatched(SD_LIVE_TIMEOUT_MS) && refProveAlive();
   g_refSawHigh = false;
   g_refSawLow = false;
-  g_refTicks = 0;
+  g_refWindowMs = millis();
 
   g_lastWriteMs = millis();
   g_begun = true;
@@ -588,19 +606,30 @@ bool sdAllSettled() {
   return true;
 }
 
-// One sample per tick, accumulated. A reference that has stopped toggling makes
-// the gap test meaningless, so it is treated as a loss of the safety property
-// rather than a cosmetic fault.
+/*
+  Accumulates both levels of the reference and re-verifies its duty once per
+  window. A reference that has stopped toggling makes the gap test meaningless,
+  so that is treated as a loss of the safety property, not a cosmetic fault.
+
+  Must be called as often as possible, and the window is measured in TIME rather
+  than in calls. An earlier version counted calls and was invoked once per frame,
+  which aliased: the reference is HIGH for only 2500 us of every 20000, so a
+  sample taken once per 20 ms frame lands at nearly the same phase every time and
+  can miss the HIGH indefinitely. On hardware that declared a perfectly healthy
+  reference dead and refused every attach.
+*/
 static void superviseRef() {
   if (gpio_get_level((gpio_num_t)PIN_LEDC_BIND)) g_refSawHigh = true;
   else g_refSawLow = true;
 
-  if (++g_refTicks < SD_REF_WINDOW_TICKS) return;
+  const uint32_t now = millis();
+  if ((uint32_t)(now - g_refWindowMs) < SD_REF_WINDOW_MS) return;
+  g_refWindowMs = now;
+
   g_refOk = g_refSawHigh && g_refSawLow &&
             (liveDuty(SD_REF_CHANNEL) == usToDuty(SD_REF_US));
   g_refSawHigh = false;
   g_refSawLow = false;
-  g_refTicks = 0;
 }
 
 /*
@@ -614,11 +643,15 @@ static void superviseRef() {
 */
 void sdService() {
   if (!g_begun) return;
+
+  // Before the cadence gate, deliberately. Supervision needs to sample far
+  // faster than the frame it is watching; gating it to once per frame is what
+  // made it alias and report a live reference as dead.
+  superviseRef();
+
   const uint32_t now = millis();
   if ((uint32_t)(now - g_lastWriteMs) < SD_FRAME_MS) return;
   g_lastWriteMs = now;
-
-  superviseRef();
 
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
     SdChan& c = g_ch[i];
