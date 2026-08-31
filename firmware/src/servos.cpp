@@ -2,24 +2,30 @@
 #include "Config.h"
 #include "now.h"
 #include "store.h"
+#include "servo_driver.h"
 #include "driver/gpio.h"
-#include "rom/gpio.h"
-#include "soc/gpio_sig_map.h"
 #include <math.h>
 #ifndef M_PI
 #define M_PI 3.14159265f
 #endif
 
-// One LEDC channel per job. 2–4 already move the 12 V units.
-// Wrists use 5–6 (not 0–1).
-static const uint8_t LEDC_CH[NUM_SERVOS] = {5, 6, 2, 3, 4};
-static const int LEDC_BITS = 12;
-static const int LEDC_HZ = 50;
-static uint8_t g_ledcOn = 0;  // bit i: LEDC_CH[i] already ledcSetup'd
+/*
+  This file owns poses, calibration and sequencing. It does NOT touch a servo pad
+  or an LEDC register — servo_driver does, and refuses anything it cannot do
+  safely. The LEDC channel map, duty conversion, pad handover and the per-frame
+  step ceiling all moved there.
+
+  Two consequences worth keeping in mind when reading the rest of this file:
+
+  - g_actual[ch] is what the ramp has ASKED for. What the servo has actually been
+    given is sdWritten(ch), which lags while the driver slews. Arrival is judged
+    on the driver's value, never on g_actual.
+  - The attach mask is not mirrored here. sdAttached / sdAttachMask are the single
+    source of truth, so this file cannot drift out of step with the hardware.
+*/
 
 static bool g_armed = false;
 static bool g_haveCommanded = false;
-static uint8_t g_attachMask = 0;
 static uint8_t g_cycledMask = 0; // bit i: attach→closed→detach this boot
 static bool g_brakeReady = false;
 static bool g_armSeqOn = false;
@@ -82,6 +88,7 @@ static int g_rampFrom[NUM_SERVOS];
 static uint32_t g_rampDist = 0;
 static uint32_t g_rampDur = 0;
 static unsigned long g_rampT0 = 0;
+static unsigned long g_rampLastMs = 0;  // last tick the ramp clock was allowed to advance
 static bool g_rampOn = false;
 
 static bool isHugCh(uint8_t ch) {
@@ -90,6 +97,9 @@ static bool isHugCh(uint8_t ch) {
 
 static int softMinOf(uint8_t ch) { return g_cal[ch].softMin; }
 static int softMaxOf(uint8_t ch) { return g_cal[ch].softMax; }
+
+static void pushLimits(uint8_t ch);
+static void pushAllLimits();
 
 static int clampToSoft(uint8_t ch, int us) {
   return constrain(us, softMinOf(ch), softMaxOf(ch));
@@ -198,6 +208,10 @@ void servosClampSoftInsideHard(uint8_t ch) {
   c.softMin = constrain(c.softMin, c.hardMin, c.hardMax - 20);
   c.softMax = constrain(c.softMax, c.softMin + 20, c.hardMax);
   c.center = constrain(c.center, c.softMin, c.softMax);
+  // Every limit setter funnels through here, so this is the one place that has to
+  // tell the driver. Tightening a window under a live or prepared channel makes
+  // the driver re-clamp rather than jump.
+  pushLimits(ch);
 }
 
 void servosDefaultPosesFromCal() {
@@ -258,6 +272,10 @@ void servosAuditEnvelope() {
                     SERVO_NAMES[i], o - c, h - c, lo - smin, smax - hi);
     }
   }
+  // Runs right after the stored calibration is applied, and store writes g_cal
+  // through servosCal() without going near the setters, so this is where NVS
+  // limits reach the driver.
+  pushAllLimits();
 }
 
 void servosApplyDefaults() {
@@ -275,6 +293,7 @@ void servosApplyDefaults() {
   }
   servosDefaultPosesFromCal();
   g_pose = POSE_CLOSED;
+  pushAllLimits();
 }
 
 void abortPath() {
@@ -293,37 +312,40 @@ void abortPath() {
   g_armSeqOn = false;
 }
 
-static uint32_t usToDuty(int us) {
-  const uint32_t maxd = (1u << LEDC_BITS) - 1u;
-  if (us < 0) us = 0;
-  if (us > 20000) us = 20000;
-  return (uint32_t)(((uint32_t)us * maxd) / 20000u);
+static bool chAttached(uint8_t ch) { return sdAttached(ch); }
+
+/*
+  States intent. The driver clamps to the configured window and moves the emitted
+  pulse there no faster than PULSE_MAX_STEP_US per frame, so a caller cannot
+  produce a step the operator could not interrupt — including this file's own
+  ramp catching up after a stalled loop.
+*/
+static void commandUs(uint8_t ch, int us) {
+  if (ch >= NUM_SERVOS || !sdAttached(ch)) return;
+  sdCommand(ch, us);
 }
 
-static bool chAttached(uint8_t ch) {
-  return ch < NUM_SERVOS && (g_attachMask & (1u << ch)) != 0;
-}
-
-static void pwmWrite(uint8_t ch, int us) {
+/*
+  Calibration lives here, enforcement lives in the driver, so any change to the
+  window has to be pushed down. Nothing outside these limits is ever emitted,
+  whatever this file asks for.
+*/
+static void pushLimits(uint8_t ch) {
   if (ch >= NUM_SERVOS) return;
-  if (!chAttached(ch)) return;
-  us = clampToSoft(ch, us);
-  ledcWrite(LEDC_CH[ch], usToDuty(us));
+  sdSetLimits(ch, g_cal[ch].hardMin, g_cal[ch].hardMax,
+              g_cal[ch].softMin, g_cal[ch].softMax);
 }
 
-// Pin stays INPUT (no drive). Latch 1 so the next gpio_matrix_out
-// enable-window is HIGH, not reset's 0 (LOW = slam open on raises).
-static void latchHigh(int pin) {
-  gpio_set_level((gpio_num_t)pin, 1);
+static void pushAllLimits() {
+  for (uint8_t i = 0; i < NUM_SERVOS; i++) pushLimits(i);
 }
 
-static void releasePins() {
-  for (uint8_t i = 0; i < NUM_SERVOS; i++) {
-    gpio_matrix_out(SERVO_PINS[i], SIG_GPIO_OUT_IDX, false, false);
-    pinMode(SERVO_PINS[i], INPUT);
-    latchHigh(SERVO_PINS[i]);
-  }
-}
+/*
+  storeSaveLastCmd writes NVS, which blocks for milliseconds. It used to run from
+  inside a release, putting a flash write in the middle of the motion path. It is
+  deferred to an idle tick instead — see serviceLastCmdSave.
+*/
+static bool g_lastCmdDirty = false;
 
 static void traceNoteLoopCore();  // defined with the trace ring below
 
@@ -332,8 +354,6 @@ void servosBegin() {
   servosApplyDefaults();
   g_armed = false;
   g_haveCommanded = false;
-  g_attachMask = 0;
-  g_ledcOn = 0;
   g_cycledMask = 0;
   g_brakeReady = false;
   g_poseKnown = false;
@@ -350,13 +370,20 @@ void servosBegin() {
     g_setupIdleAt[i] = 0;
   }
   abortPath();
-  releasePins();
+
+  // Configures the one shared timer, parks all five pads and proves the phase
+  // reference is toggling. A false return means nothing is allowed to attach, so
+  // it is worth saying out loud rather than discovering it at ARM time.
+  if (!sdBegin()) {
+    Serial.println(F("*** SERVO DRIVER REFUSED TO START — nothing can attach ***"));
+  }
+  pushAllLimits();
 }
 
 ChannelCal& servosCal(uint8_t ch) { return g_cal[ch]; }
 bool servosIsArmed() { return g_armed; }
 bool servosIsBrakeReady() { return g_brakeReady; }
-uint8_t servosAttachMask() { return g_attachMask; }
+uint8_t servosAttachMask() { return sdAttachMask(); }
 WingPose getWingPose() { return g_pose; }
 bool pathIsActive() { return g_path != PATH_NONE || g_flapOn || g_armSeqOn; }
 PathId pathGet() { return g_path; }
@@ -477,11 +504,13 @@ void servosSetCenter(uint8_t ch, int us) {
   printing inline would perturb what we are trying to observe. Dump with the
   serial `trace` command after a wig-out, while the board is still powered.
 
-  The datum this exists for is the first-pulse fragment. A connect that lands
-  inside the frame's HIGH phase gives the servo only the remainder of that
-  pulse, and a remainder in the 500-900 us band is a valid command to a
-  position well below target — a slam. Measured directly, because the pad is
-  live and readable the instant the matrix routes it.
+  This originally existed to catch the first-pulse fragment: a connect landing
+  inside the frame's HIGH phase gives the servo only the remainder of that pulse,
+  and a remainder in the 500-900 us band is a valid command to a position well
+  below target. The driver now makes that impossible by construction — handovers
+  happen in the idle gap, verified on hardware over 2500 attaches with zero short
+  pulses — so the fragment probe is gone and the interesting rows are now the
+  REFUSE ones: what the driver declined to do, and why.
 */
 
 enum TraceEv : uint8_t {
@@ -491,6 +520,7 @@ enum TraceEv : uint8_t {
   TR_DONE,
   TR_STALL,
   TR_BLOCK,   // service gap caused by this firmware's own blocking attach
+  TR_REFUSE,  // driver declined a handover; detail = SdResult
 };
 
 // Not a servo index: keeps stage/aggregate rows out of the channel column.
@@ -525,7 +555,7 @@ static uint8_t  g_slamHead = 0;
 static uint32_t g_slamTotal = 0;
 
 // Attaches that ran since the last service tick, so a gap caused by
-// holdLedcUs's own 80 ms of delay() is not misread as a ramp stall.
+// the driver's own gap and latch waits are not misread as a ramp stall.
 static uint8_t g_attachSinceService = 0;
 
 static uint8_t traceCtx() {
@@ -554,9 +584,10 @@ static void traceAdd(uint8_t ev, uint8_t ch, uint8_t padHigh, int us, int detail
   g_traceHead = (uint16_t)((g_traceHead + 1) % TRACE_N);
   if (g_traceTotal != 0xFFFFFFFFu) g_traceTotal++;
 
-  // Any measured first pulse shorter than the hard-min band is a command below
-  // target, which is the event this whole exercise exists to catch.
-  if (ev == TR_ATTACH && detail > 0 && detail < DEFAULT_HARD_MIN) {
+  // A refused handover is the sticky event now. Nothing moved, but the driver
+  // declining means a stage did not start, and that must survive later traffic
+  // in the ring the same way a slam used to.
+  if (ev == TR_REFUSE) {
     g_slam[g_slamHead] = r;
     g_slamHead = (uint8_t)((g_slamHead + 1) % SLAM_N);
     if (g_slamTotal != 0xFFFFFFFFu) g_slamTotal++;
@@ -564,29 +595,10 @@ static void traceAdd(uint8_t ev, uint8_t ch, uint8_t padHigh, int us, int detail
 }
 
 // servosBegin runs on the Arduino loop task, so this records the core that owns
-// the motion path.
+// the motion path. Reported by the trace dump, since a motion command arriving
+// on the NimBLE task instead is itself a finding.
 static int g_loopCore = -1;
 static void traceNoteLoopCore() { g_loopCore = (int)xPortGetCoreID(); }
-
-/*
-  Spinning here holds the pad live while g_attachMask is still clear. On the
-  loop task that slice is harmless because nothing else touches the mask. The
-  BLE path runs motion on the NimBLE host task on the other core, in parallel
-  with servosService, so widening that slice there would add real risk to an
-  already-racy path. Off the loop task the measurement is skipped and the row
-  is marked unmeasured rather than reported as a clean gap connect.
-*/
-static const int FRAG_NOT_MEASURED = -1;
-
-static int firstPulseFragment(int pin) {
-  if (g_loopCore >= 0 && (int)xPortGetCoreID() != g_loopCore) return FRAG_NOT_MEASURED;
-  if (!gpio_get_level((gpio_num_t)pin)) return 0;
-  const uint32_t t0 = micros();
-  while (gpio_get_level((gpio_num_t)pin)) {
-    if ((uint32_t)(micros() - t0) > 2600) return 2600;
-  }
-  return (int)(micros() - t0);
-}
 
 void servosTraceClear() {
   g_traceHead = 0;
@@ -605,16 +617,13 @@ static void tracePrintRow(const TraceRec& r) {
     case TR_DONE:   ev = "DONE";   break;
     case TR_STALL:  ev = "STALL";  break;
     case TR_BLOCK:  ev = "BLOCK";  break;
+    case TR_REFUSE: ev = "REFUSE"; break;
     default: break;
   }
 
   const char* flag = "";
-  if (r.ev == TR_ATTACH && r.detail == FRAG_NOT_MEASURED) {
-    flag = "  not measured — attach ran off the loop task (BLE)";
-  } else if (r.ev == TR_ATTACH && r.detail > 0) {
-    if (r.detail < SERVO_ABS_MIN)         flag = "  fragment, servo likely ignores it";
-    else if (r.detail < DEFAULT_HARD_MIN) flag = "  SHORT FIRST PULSE — slam capable";
-    else if (r.detail < 1400)             flag = "  short first pulse — below target";
+  if (r.ev == TR_REFUSE) {
+    flag = sdResultName((SdResult)r.detail);
   } else if (r.ev == TR_DETACH && r.detail >= 0 && r.detail < 20) {
     flag = "  released inside one frame of the final write";
   }
@@ -628,18 +637,18 @@ static void tracePrintRow(const TraceRec& r) {
 }
 
 void servosTraceDump() {
-  Serial.println(F("ATTACH detail = width of the first pulse the servo received"));
-  Serial.println(F("               0 means the connect landed in the idle gap (clean)"));
-  Serial.println(F("              -1 means not measured (attach ran off the loop task)"));
+  Serial.println(F("REFUSE detail = SdResult; the driver declined, nothing connected"));
   Serial.println(F("DETACH detail = settle dwell still remaining, ms (-1 = no group hold)"));
   Serial.println(F("padHigh       = pad was HIGH immediately before the transition"));
   Serial.println(F("p/s           = path id / stage index at the time"));
+  Serial.printf("driver        : refOk=%d faultMask=0x%02X loopCore=%d\n",
+                sdRefOk() ? 1 : 0, sdFaultMask(), g_loopCore);
 
   const uint8_t slamShown = (g_slamTotal < SLAM_N) ? (uint8_t)g_slamTotal : SLAM_N;
-  Serial.printf("\nSHORT FIRST PULSES: %lu total, last %u kept\n",
+  Serial.printf("\nREFUSED HANDOVERS: %lu total, last %u kept\n",
                 (unsigned long)g_slamTotal, (unsigned)slamShown);
   if (slamShown == 0) {
-    Serial.println(F("  none — every connect so far landed in the idle gap"));
+    Serial.println(F("  none — every handover the driver was asked for succeeded"));
   } else {
     Serial.println(F("      t_ms  event   channel      pad  path     us  detail"));
     for (uint8_t k = 0; k < slamShown; k++) {
@@ -656,56 +665,95 @@ void servosTraceDump() {
   }
 }
 
-// LEDC on BIND only. ledcSetup starts at duty 0 — never connect a servo
-// pad until ledcRead matches the commanded duty.
-static bool holdLedcUs(uint8_t ch, int us) {
-  if (ch >= NUM_SERVOS) return false;
-  uint8_t chan = LEDC_CH[ch];
-  uint32_t duty = usToDuty(us);
-  if (!(g_ledcOn & (1u << ch))) {
-    ledcSetup(chan, LEDC_HZ, LEDC_BITS);
-    g_ledcOn |= (1u << ch);
-  }
-  ledcWrite(chan, duty);
-  ledcAttachPin(PIN_LEDC_BIND, chan);
-  for (int n = 0; n < 4; n++) {
-    ledcWrite(chan, duty);
-    delay(20);
-  }
-  uint32_t got = ledcRead(chan);
-  if (got != duty) {
-    Serial.printf("LEDC refuse %s read=%lu want=%lu — pad stays INPUT\n",
-                  SERVO_NAMES[ch], (unsigned long)got, (unsigned long)duty);
-    return false;
-  }
-  return true;
-}
+/*
+  Adopts whatever the driver actually prepared, which may be tighter than what was
+  asked for. Comparing against sdPreparedUs rather than trusting that sdPrepared
+  is true matters: the position the servo wakes up holding is the prepared value,
+  not the request, and the two differ whenever the soft window clamps.
+*/
+static uint8_t groupCount(int g);
+static uint8_t groupChAt(int g, uint8_t idx);
 
-static void connectServoPad(uint8_t ch) {
-  int pin = SERVO_PINS[ch];
-  uint8_t chan = LEDC_CH[ch];
-  // gpio_matrix_out enables the pad. Latch HIGH first so a raise cannot
-  // see a LOW enable-window (LOW µs = slam open on SH/ER/WR).
-  const uint8_t wasHigh = gpio_get_level((gpio_num_t)pin) ? 1 : 0;
-  gpio_set_level((gpio_num_t)pin, 1);
-  gpio_matrix_out(pin, LEDC_LS_SIG_OUT0_IDX + (chan % 8), false, false);
-  traceAdd(TR_ATTACH, ch, wasHigh, g_actual[ch], firstPulseFragment(pin));
+static void adoptPrepared(uint8_t ch) {
+  g_actual[ch] = sdPreparedUs(ch);
   if (g_attachSinceService < 255) g_attachSinceService++;
 }
 
 static bool attachAtUs(uint8_t i, int us) {
   if (i >= NUM_SERVOS) return false;
-  if (chAttached(i)) return true;
-  us = constrain(us, SERVO_ABS_MIN, SERVO_ABS_MAX);
-  if (!holdLedcUs(i, us)) return false;
-  connectServoPad(i);
-  g_attachMask |= (1u << i);
-  g_actual[i] = us;
-  ledcWrite(LEDC_CH[i], usToDuty(us));
-  ledcWrite(LEDC_CH[i], usToDuty(us));
-  Serial.printf("PWM ch%u %s -> GPIO%u LEDC%u us=%d\n",
-                (unsigned)i, SERVO_NAMES[i], SERVO_PINS[i],
-                (unsigned)LEDC_CH[i], us);
+  if (sdAttached(i)) return true;
+
+  const uint8_t wasHigh = gpio_get_level((gpio_num_t)SERVO_PINS[i]) ? 1 : 0;
+  const SdResult r = sdAttachNow(i, constrain(us, SERVO_ABS_MIN, SERVO_ABS_MAX));
+  if (r != SD_OK) {
+    // A refusal is the driver working. Nothing is connected, so the caller's
+    // stage simply does not start.
+    Serial.printf("ATTACH refuse %s — %s\n", SERVO_NAMES[i], sdResultName(r));
+    traceAdd(TR_REFUSE, i, wasHigh, us, (int)r);
+    return false;
+  }
+  adoptPrepared(i);
+  traceAdd(TR_ATTACH, i, wasHigh, g_actual[i], 0);
+  Serial.printf("PWM ch%u %s -> GPIO%u us=%d\n",
+                (unsigned)i, SERVO_NAMES[i], SERVO_PINS[i], g_actual[i]);
+  return true;
+}
+
+/*
+  Hands a whole stage over inside ONE idle gap, in one critical section.
+
+  This is what the single shared timer buys and it is measured, not assumed: on
+  hardware both pads of a pair rise on the same counter reset, worst skew 0 us
+  over 500 group cycles. One gap wait for the stage instead of one per servo, and
+  either the whole stage goes live or none of it does — a half-attached stage
+  mid-move is worse than a refused one.
+*/
+static bool attachStageTogether(int g) {
+  uint8_t chs[MAX_STAGE_CH];
+  uint8_t n = 0;
+
+  for (uint8_t i = 0; i < groupCount(g); i++) {
+    const uint8_t ch = groupChAt(g, i);
+    if (ch >= NUM_SERVOS || sdAttached(ch)) continue;
+    if (n >= MAX_STAGE_CH) break;   // groupCount cannot exceed this, but chs is a buffer
+    const SdResult p = sdPrepare(ch, clampToSoft(ch, g_actual[ch]));
+    if (p != SD_OK) {
+      Serial.printf("STAGE refuse %s — prepare %s\n", SERVO_NAMES[ch], sdResultName(p));
+      return false;
+    }
+    chs[n++] = ch;
+  }
+  if (n == 0) return true;
+
+  // One latch wait for the stage rather than one per servo: the channels share a
+  // timer, so they all go live on the same frame.
+  const uint32_t t0 = millis();
+  for (;;) {
+    bool live = true;
+    for (uint8_t k = 0; k < n; k++) if (!sdDutyLive(chs[k])) live = false;
+    if (live) break;
+    if ((uint32_t)(millis() - t0) > SD_LIVE_TIMEOUT_MS) {
+      Serial.println(F("STAGE refuse — duty never went live"));
+      return false;
+    }
+  }
+
+  uint8_t wasHigh[MAX_STAGE_CH];
+  for (uint8_t k = 0; k < n; k++) {
+    wasHigh[k] = gpio_get_level((gpio_num_t)SERVO_PINS[chs[k]]) ? 1 : 0;
+  }
+
+  const SdResult r = sdAttachGroup(chs, n);
+  if (r != SD_OK) {
+    Serial.printf("STAGE refuse — group attach %s\n", sdResultName(r));
+    traceAdd(TR_REFUSE, TR_NO_CH, 0, (int)n, (int)r);
+    return false;
+  }
+
+  for (uint8_t k = 0; k < n; k++) {
+    adoptPrepared(chs[k]);
+    traceAdd(TR_ATTACH, chs[k], wasHigh[k], g_actual[chs[k]], 0);
+  }
   return true;
 }
 
@@ -822,8 +870,38 @@ static uint8_t groupChAt(int g, uint8_t idx) {
   return g_stageCh[g][idx];
 }
 
+/*
+  Arrival is judged on what the servo has actually been GIVEN, not on what the
+  ramp asked for.
+
+  g_actual is the commanded value and reaches the target as soon as the cosine
+  finishes; sdWritten is what the driver has emitted, and it lags while the driver
+  slews. Testing g_actual would report arrival with the pulse still travelling,
+  which is how the release used to fire before the servo got there.
+*/
 static bool chNeedsMove(uint8_t ch) {
-  return ch < NUM_SERVOS && abs(g_actual[ch] - g_target[ch]) > ARRIVE_US;
+  if (ch >= NUM_SERVOS) return false;
+  const int at = sdAttached(ch) ? sdWritten(ch) : g_actual[ch];
+  return abs(at - g_target[ch]) > ARRIVE_US;
+}
+
+static uint8_t stageAttachedCount(int g) {
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < groupCount(g); i++) {
+    const uint8_t ch = groupChAt(g, i);
+    if (ch < NUM_SERVOS && sdAttached(ch)) n++;
+  }
+  return n;
+}
+
+// True once the driver has emitted everything commanded for the stage, so the
+// ramp is not running ahead of the hardware.
+static bool groupSettled(int g) {
+  for (uint8_t i = 0; i < groupCount(g); i++) {
+    const uint8_t ch = groupChAt(g, i);
+    if (ch < NUM_SERVOS && sdAttached(ch) && !sdSettled(ch)) return false;
+  }
+  return true;
 }
 
 static bool groupArrived(int g) {
@@ -863,6 +941,7 @@ static void beginGroupRamp(int g) {
   }
 
   g_rampT0 = millis();
+  g_rampLastMs = g_rampT0;
   g_rampOn = true;
   Serial.printf("EASE dist=%lu dur=%lu\n",
                 (unsigned long)g_rampDist, (unsigned long)g_rampDur);
@@ -871,6 +950,21 @@ static void beginGroupRamp(int g) {
 static void serviceCosineRamp() {
   if (!g_rampOn || g_group < 0) return;
   unsigned long now = millis();
+
+  /*
+    While the driver is still catching up, hold the ramp clock rather than letting
+    it run. Advancing it would put the profile ahead of the hardware, and the
+    difference would then arrive as one large step the moment the driver caught up
+    — exactly the shape of a jump. Pushing T0 forward by the skipped interval
+    preserves the ease rather than re-basing it, which would restart the curve.
+  */
+  if (!groupSettled(g_group)) {
+    g_rampT0 += (unsigned long)(now - g_rampLastMs);
+    g_rampLastMs = now;
+    return;
+  }
+  g_rampLastMs = now;
+
   uint32_t elapsed = (uint32_t)(now - g_rampT0);
   float s = cosineFrac(elapsed, g_rampDur);
   bool done = (elapsed >= g_rampDur) || (g_rampDist == 0);
@@ -888,7 +982,7 @@ static void serviceCosineRamp() {
       const int step = next - g_actual[ch];
       if (step > 80 || step < -80) traceAdd(TR_JUMP, ch, 0, next, step);
       g_actual[ch] = next;
-      pwmWrite(ch, g_actual[ch]);
+      commandUs(ch, g_actual[ch]);
     }
   }
 
@@ -898,20 +992,33 @@ static void serviceCosineRamp() {
   }
 }
 
-static void releaseOnePin(uint8_t i) {
-  // Disconnect LEDC from the pad. Do not gpio_reset_pin — that can drive
-  // LOW (~0 µs) and slam a raise on the next attach.
+/*
+  Hands the pad back to the driver, which times the release so no pulse is cut
+  short and rests the pad at 0 V.
+
+  A false return is not cosmetic. The driver could not prove the frame was idle,
+  so it deliberately LEFT THE PAD ROUTED rather than truncate a pulse — the servo
+  is still being driven and only the supply e-stop will stop it. That cannot be
+  silent, so it prints even though printing from the motion path is otherwise
+  avoided: by this point there is nothing left to perturb.
+*/
+static bool releaseOnePin(uint8_t i) {
   const uint8_t wasHigh = gpio_get_level((gpio_num_t)SERVO_PINS[i]) ? 1 : 0;
-  // How much settle dwell was actually left. armGroupHold stamps this deadline
-  // when the attach completes rather than at arrival, so it is expected to be
-  // long expired by the time a move finishes — this turns that into a number.
+  // Settle dwell still remaining. Now that the dwell is stamped at arrival this
+  // should be a healthy positive number; it used to be stamped at attach and was
+  // therefore long expired by the time a move finished.
   const int holdLeft = (g_groupHoldUntil == 0)
                          ? -1
                          : (int)((long)g_groupHoldUntil - (long)millis());
-  gpio_matrix_out(SERVO_PINS[i], SIG_GPIO_OUT_IDX, false, false);
-  pinMode(SERVO_PINS[i], INPUT);
-  latchHigh(SERVO_PINS[i]);
+
+  const bool ok = sdDetach(i);
   traceAdd(TR_DETACH, i, wasHigh, g_actual[i], holdLeft);
+  if (!ok) {
+    Serial.printf("*** RELEASE REFUSED %s — PAD STILL LIVE, faultMask=0x%02X ***\n",
+                  SERVO_NAMES[i], sdFaultMask());
+    Serial.println(F("*** servo is still driven; cut the supply to stop it ***"));
+  }
+  return ok;
 }
 
 static void noteCycled(uint8_t i) {
@@ -927,18 +1034,24 @@ static void noteCycled(uint8_t i) {
 }
 
 static void detachOne(uint8_t i) {
-  if (!chAttached(i)) return;
+  if (!sdAttached(i)) return;
+  /*
+    Adopt what the servo was actually GIVEN before letting go of it.
+
+    Mid-move the ramp has commanded further than the driver has emitted, and
+    g_actual is what gets persisted as lastcmd and used as the next attach
+    position. Keeping the commanded value here would record a position the horn
+    never reached and produce a jump at the start of the next move. Also makes the
+    noteCycled home test below judge where the servo is, not where it was going.
+  */
+  g_actual[i] = sdWritten(i);
   noteCycled(i);
-  // Pin was matrix-only — never ledcAttachPin'd. ledcDetachPin on the
-  // servo GPIO resets the pad and can pulse ~0 µs.
-  g_attachMask &= (uint8_t)~(1u << i);
   g_jogMask &= (uint8_t)~(1u << i);
   g_setupIdleAt[i] = 0;
   releaseOnePin(i);
-  if (!g_runMotion) {
-    g_armed = (g_attachMask != 0);
-  }
-  storeSaveLastCmd();
+  // Derived from the driver, so a refused release correctly leaves this armed.
+  if (!g_runMotion) g_armed = (sdAttachMask() != 0);
+  g_lastCmdDirty = true;
 }
 
 static void detachGroup(int g) {
@@ -950,13 +1063,13 @@ static void detachGroup(int g) {
 
 static void detachAll() {
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
-    if (!chAttached(i)) continue;
-    g_attachMask &= (uint8_t)~(1u << i);
+    if (!sdAttached(i)) continue;
+    g_actual[i] = sdWritten(i);   // see detachOne
     g_jogMask &= (uint8_t)~(1u << i);
     g_setupIdleAt[i] = 0;
     releaseOnePin(i);
   }
-  storeSaveLastCmd();
+  g_lastCmdDirty = true;
 }
 
 static void startPath(PathId path, SpeedTier s1, SpeedTier s2);
@@ -976,12 +1089,14 @@ static void attachNextInGroup() {
 static void kickGroup() {
   while (g_group >= 0 && g_group < (int)g_nStages) {
     g_groupAttachIdx = 0;
-    g_groupHoldUntil = 0;  // arm after last attach (stagger must not eat MIN hold)
-    attachNextInGroup();
-    // RUN open/close: attach the whole group now. Stagger was a jerk +
-    // ~300 ms sit on the first raise before the others moved.
+    g_groupHoldUntil = 0;  // stamped at ARRIVAL, not here — see serviceGroup
+    // RUN open/close: the whole stage goes live on one frame. Staggering was a
+    // jerk plus ~300 ms sat on the first raise before the others moved.
     if (!g_forceDwell) {
-      while (g_groupAttachIdx < groupCount(g_group)) attachNextInGroup();
+      if (attachStageTogether(g_group)) g_groupAttachIdx = groupCount(g_group);
+      g_lastAttachMs = millis();
+    } else {
+      attachNextInGroup();
     }
     return;
   }
@@ -1006,13 +1121,44 @@ static void serviceGroup() {
     return;
   }
 
-  armGroupHold();
+  /*
+    A stage that attached nothing must not sit here forever.
+
+    serviceCosineRamp only writes attached channels, so with none attached g_actual
+    never moves, groupArrived never becomes true, and the path waits below with the
+    wing parked mid-pose until someone presses STOP. Refusing the move outright is
+    the honest outcome, and it leaves no pad pulsing.
+  */
+  if (stageAttachedCount(g_group) == 0) {
+    Serial.printf("STAGE %d attached nothing — path aborted\n", (int)g_group);
+    traceAdd(TR_REFUSE, TR_NO_CH, 0, g_group, (int)SD_NOT_PREPARED);
+    abortPath();
+    return;
+  }
 
   // Attach complete — start the time-based cosine once, then wait for arrival + hold.
   if (!g_rampOn && !groupArrived(g_group)) beginGroupRamp(g_group);
   if (g_rampOn) return;
   if (!groupArrived(g_group)) return;
-  if (g_groupHoldUntil != 0 && millis() < g_groupHoldUntil) return;
+
+  // Wait for the driver to have emitted everything it was given before calling
+  // the move finished. Arrival above is measured on sdWritten, so this is belt
+  // and braces for a channel that arrived while another is still slewing.
+  if (!groupSettled(g_group)) return;
+
+  /*
+    Dwell is stamped HERE, at arrival, which is the fix for the extra motion after
+    a move ended.
+
+    It used to be stamped when the attach completed, and g_rampDur almost always
+    exceeds MIN_STAGE_HOLD_MS, so the dwell had already expired by the time the
+    ramp finished. detachGroup then fired one service iteration after the final
+    pulse write — a few milliseconds — which is not long enough for the frame to
+    latch. The servo could lose the pad before ever receiving a pulse at the
+    target position.
+  */
+  armGroupHold();
+  if (millis() < g_groupHoldUntil) return;
 
   Serial.printf("STAGE %d done — pulse off\n", (int)g_group);
   detachGroup(g_group);
@@ -1129,7 +1275,7 @@ static void servicePath() {
   finishPath();
   g_runMotion = false;
   g_forceDwell = false;
-  g_armed = (g_attachMask != 0);
+  g_armed = (sdAttachMask() != 0);
   Serial.println(F("PATH done — pulses off"));
   if (g_flapPending && g_pose == POSE_OPEN) {
     g_flapPending = false;
@@ -1191,20 +1337,28 @@ static void serviceArmSeq() {
 void servosDisarm() {
   abortPath();
   detachAll();
-  g_armed = false;
-  Serial.println(F("DISARMED"));
+  // Derived, not asserted: if the driver refused a release the pad is still live
+  // and claiming DISARMED would be a lie about a servo that is still driven.
+  g_armed = (sdAttachMask() != 0);
+  Serial.println(g_armed ? F("DISARM INCOMPLETE — a pad is still live")
+                         : F("DISARMED"));
 }
 
-// STOP is not "hold PWM". Abort, keep last commanded µs, detach so
+// STOP is not "hold PWM". Abort, keep where the servo actually is, detach so
 // the ANNIMOS brake holds. Do not change g_pose (may be mid-path).
 void servosStop() {
   abortPath();
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
+    // Halt at the emitted position, not the commanded one: mid-move the ramp is
+    // ahead of the driver, and stopping at the commanded value would ask for one
+    // last move rather than stopping.
+    if (sdAttached(i)) g_actual[i] = sdWritten(i);
     g_target[i] = g_actual[i];
   }
   detachAll();
-  g_armed = false;
-  Serial.println(F("STOP — last actual, detached (brake)"));
+  g_armed = (sdAttachMask() != 0);
+  Serial.println(g_armed ? F("STOP INCOMPLETE — a pad is still live")
+                         : F("STOP — last actual, detached (brake)"));
 }
 
 void servosDisarmCh(uint8_t ch) {
@@ -1382,7 +1536,7 @@ static void finishFlap() {
   g_flapHome = false;
   detachOne(CH_ELBOW2);
   detachOne(CH_WRIST2);
-  g_armed = (g_attachMask != 0);
+  g_armed = (sdAttachMask() != 0);
   g_pose = POSE_OPEN;
   Serial.println(F("FLAP done — hugs at center, brake"));
 }
@@ -1505,7 +1659,7 @@ static void serviceJogEase() {
     next = clampToSoft(ch, next);
     if (next != g_actual[ch]) {
       g_actual[ch] = next;
-      pwmWrite(ch, g_actual[ch]);
+      commandUs(ch, g_actual[ch]);
     }
     if (done) {
       g_jogMask &= (uint8_t)~(1u << ch);
@@ -1532,11 +1686,30 @@ static void serviceSetupIdle() {
   }
 }
 
+/*
+  Deferred so a flash write never lands inside the motion path. Only runs once
+  everything is genuinely idle and no pad is live, which is also the only moment
+  g_actual is stable enough to be worth persisting.
+*/
+static void serviceLastCmdSave() {
+  if (!g_lastCmdDirty) return;
+  if (g_runMotion || g_rampOn || g_flapOn || g_armSeqOn) return;
+  if (g_jogMask != 0 || sdAttachMask() != 0) return;
+  g_lastCmdDirty = false;
+  storeSaveLastCmd();
+}
+
 void servosService() {
-  // A stalled service loop is what turns a smooth ramp into a single large
-  // step, so the gap is recorded rather than inferred.
-  // holdLedcUs blocks 80 ms per attach, so a gap that follows an attach is this
-  // firmware blocking itself, not the symptom being hunted. Logged separately.
+  // Emits pending pulses on the frame cadence and supervises the phase
+  // reference. Runs FIRST and unconditionally: supervision has to sample far
+  // faster than the 20 ms frame it is watching, and loop() calls this every
+  // iteration with no delay.
+  sdService();
+
+  // A stalled service loop is what turns a smooth ramp into a single large step,
+  // so the gap is recorded rather than inferred. An attach still blocks for the
+  // gap and latch waits, so a gap that follows one is this firmware waiting on
+  // purpose rather than the symptom being hunted. Logged separately.
   static uint32_t lastServiceMs = 0;
   const uint32_t nowMs = millis();
   if (lastServiceMs != 0) {
@@ -1556,6 +1729,7 @@ void servosService() {
   serviceFlap();
   serviceSetupIdle();
   serviceArmSeq();
+  serviceLastCmdSave();
 }
 
 void servosHandleCmd(CmdId cmd, const int16_t* payload, uint8_t payloadLen) {
