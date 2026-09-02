@@ -30,7 +30,7 @@ void nowService();
 uint32_t nowRxCount();
 uint8_t nowWifiChannel();
 void nowBroadcastCmd(CmdId cmd, const int16_t* payload = nullptr, uint8_t len = 0);
-// Send only. No motion. Master + sync uses this before buttonExec.
+// Send only. No motion. Master + sync uses this from buttonService on the loop task.
 void nowSyncTargets();  // no-op
 void nowSetPeerMac(const uint8_t mac[6]);
 void nowClearPeer();
@@ -40,5 +40,8 @@ void nowGetLocalMac(uint8_t out[6]);
 void nowGetStatusPeerMac(uint8_t out[6]);  // saved peer, else last heard
 uint8_t nowSlaveLink();
 uint8_t nowSlaveAgeCs();  // 100 ms units, 255 = never
+bool nowHavePeerState();
+bool nowPeerBrakeReady();
+uint8_t nowPeerCycledMask();
 void nowPause(bool paused);  // while Slave is in direct BLE cal
 bool nowIsPaused();

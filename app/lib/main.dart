@@ -52,15 +52,15 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   WingsStatus? _status;
   List<ChannelCal> _cal = List.generate(5, (_) => ChannelCal());
   ChannelPoses _poses = ChannelPoses();
+  bool _posesFromBoard = false;
   List<int> _fobMap = [CmdId.toggleWing, CmdId.toggleWrist, CmdId.seq, CmdId.home];
   StreamSubscription<WingsStatus>? _sub;
   StreamSubscription<bool>? _readySub;
+  Timer? _listenResume;
   bool _ready = false;
   int _setupCh = 0;
   int _speedPct = 10;
   bool _speedDragging = false;
-  int _accelMs = kAccelMsDefault;
-  bool _accelDragging = false;
   final List<int> _chSpeed = List.filled(5, 100);
   bool _chSpeedDragging = false;
   List<int> _lastPeerMac = List.filled(6, 0);
@@ -72,6 +72,11 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     super.initState();
     _actions = WingsActions(_cmd);
     _tabs = TabController(length: 4, vsync: this);
+    _tabs.addListener(() {
+      if (!_tabs.indexIsChanging && _tabs.index == 1 && _ready) {
+        _syncFromBoard();
+      }
+    });
     _attachBle();
     _native.getLastId().then((id) {
       if (mounted) setState(() => _lastId = id);
@@ -94,6 +99,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
   @override
   void dispose() {
+    _listenResume?.cancel();
     _sub?.cancel();
     _readySub?.cancel();
     _tabs.dispose();
@@ -108,19 +114,14 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         _ready = ok;
         if (!ok) {
           _status = null;
+          _posesFromBoard = false;
           _msg = _ble.holdingLink ? 'Reconnecting…' : 'Link dropped';
         } else {
           _msg = 'Connected ${_ble.device?.platformName ?? ''}';
         }
       });
       if (ok) {
-        try {
-          _cal = await _ble.readCal();
-          if (_cal.length != 5) _cal = List.generate(5, (_) => ChannelCal());
-          _fobMap = await _ble.readFobMaps();
-          final poses = await _ble.readPoses();
-          if (poses != null) _poses = poses;
-        } catch (_) {}
+        await _syncFromBoard();
         if (mounted) setState(() => _status = _ble.lastStatus);
       }
       if (_ble.holdingLink) {
@@ -137,11 +138,6 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         if (!_speedDragging && s.speedPct >= 1 && s.speedPct <= 100) {
           _speedPct = s.speedPct;
         }
-        if (!_accelDragging &&
-            s.accelMs >= kAccelMsMin &&
-            s.accelMs <= kAccelMsMax) {
-          _accelMs = s.accelMs;
-        }
         if (!_chSpeedDragging && s.chSpeed.length == 5) {
           for (var i = 0; i < 5; i++) {
             final p = s.chSpeed[i];
@@ -149,11 +145,70 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
           }
         }
       });
+      unawaited(_syncListenToMotion(s));
     });
     if (_ble.isReady) {
       _ready = true;
       _status = _ble.lastStatus;
       _msg = 'Connected ${_ble.device?.platformName ?? ''}';
+      _syncFromBoard();
+    }
+  }
+
+  /// Pause KWS while path/seq is active. BLE and the earpiece stay connected.
+  Future<void> _syncListenToMotion(WingsStatus s) async {
+    final v = WingsSession.instance.voice;
+    if (!v.isAlways) return;
+    final moving = s.pathActive || s.seq;
+    if (moving) {
+      _listenResume?.cancel();
+      _listenResume = null;
+      await v.pauseListen();
+      try {
+        await _native.updateFg('Wings moving…');
+      } catch (_) {}
+      return;
+    }
+    if (!v.listenPaused) return;
+    if (_listenResume != null) return;
+    _listenResume = Timer(const Duration(milliseconds: 400), () async {
+      _listenResume = null;
+      final now = _ble.lastStatus;
+      if (now != null && (now.pathActive || now.seq)) return;
+      if (!v.isAlways) return;
+      unawaited(_ble.setLinkPriority(high: false));
+      await v.resumeListen();
+      try {
+        await _native.updateFg('Wings listening');
+      } catch (_) {}
+    });
+  }
+
+  /// Board NVS/RAM is source of truth. Status notify never carries taught poses.
+  Future<void> _syncFromBoard() async {
+    if (!_ble.isReady) return;
+    try {
+      final r = await _ble.readCal();
+      final p = await _ble.readPoses();
+      final f = await _ble.readFobMaps();
+      if (!mounted) return;
+      setState(() {
+        if (r.length == 5) _cal = r;
+        _fobMap = f;
+        if (p != null) {
+          _poses = p;
+          _posesFromBoard = true;
+        } else {
+          _posesFromBoard = false;
+        }
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _posesFromBoard = false;
+          _msg = 'Board read failed: $e';
+        });
+      }
     }
   }
 
@@ -192,21 +247,13 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         await _native.saveLastId(d.remoteId.str);
         await _native.updateFg('Wings connected');
       } catch (_) {}
-      try {
-        _cal = await _ble.readCal();
-        if (_cal.length != 5) _cal = List.generate(5, (_) => ChannelCal());
-        _fobMap = await _ble.readFobMaps();
-        final poses = await _ble.readPoses();
-        if (poses != null) _poses = poses;
-      } catch (_) {}
+      await _syncFromBoard();
       setState(() {
         _lastId = d.remoteId.str;
         _ready = _ble.isReady;
         _status = _ble.lastStatus;
         final sp = _ble.lastStatus?.speedPct ?? 10;
         if (sp >= 1 && sp <= 100) _speedPct = sp;
-        final am = _ble.lastStatus?.accelMs ?? kAccelMsDefault;
-        if (am >= kAccelMsMin && am <= kAccelMsMax) _accelMs = am;
         _msg = 'Connected ${d.platformName}';
       });
     } catch (e) {
@@ -225,6 +272,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     setState(() {
       _ready = false;
       _status = null;
+      _posesFromBoard = false;
       _msg = 'Disconnected';
     });
   }
@@ -253,14 +301,6 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     if (p > 100) p = 100;
     setState(() => _speedPct = p);
     await _ble.setSpeed(p);
-  }
-
-  Future<void> _setAccel(int ms) async {
-    var v = ms;
-    if (v < kAccelMsMin) v = kAccelMsMin;
-    if (v > kAccelMsMax) v = kAccelMsMax;
-    setState(() => _accelMs = v);
-    await _ble.setAccel(v);
   }
 
   Widget _speedOverride() {
@@ -302,53 +342,6 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                     style: FilledButton.styleFrom(minimumSize: const Size(0, 48)),
                     onPressed: () => _setSpeed(p),
                     child: Text('$p%'),
-                  ),
-                ),
-              ),
-          ],
-        ),
-      ],
-    );
-  }
-
-  Widget _accelOverride() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Text(
-          'Accel $_accelMs ms',
-          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
-        ),
-        const Text(
-          'Kept as a saved value. Motion is cosine ease, not a trapezoid.',
-          style: TextStyle(color: Colors.white70),
-        ),
-        Slider(
-          value: _accelMs.clamp(kAccelMsMin, kAccelMsMax).toDouble(),
-          min: kAccelMsMin.toDouble(),
-          max: kAccelMsMax.toDouble(),
-          label: '$_accelMs ms',
-          onChanged: (v) {
-            setState(() {
-              _accelDragging = true;
-              _accelMs = v.round();
-            });
-          },
-          onChangeEnd: (v) async {
-            await _setAccel(v.round());
-            setState(() => _accelDragging = false);
-          },
-        ),
-        Row(
-          children: [
-            for (final ms in [100, 250, 400, 800])
-              Expanded(
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 4),
-                  child: FilledButton.tonal(
-                    style: FilledButton.styleFrom(minimumSize: const Size(0, 48)),
-                    onPressed: () => _setAccel(ms),
-                    child: Text('${ms}ms'),
                   ),
                 ),
               ),
@@ -506,11 +499,15 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     setState(() {
       _msg = hit.keyword.isEmpty
           ? 'Heard nothing  score ${hit.score.toStringAsFixed(2)}'
-          : 'Heard ${hit.keyword}  ${hit.speaker}  ${hit.score.toStringAsFixed(2)}'
-              '${hit.speakerOk ? "" : "  NO MATCH"}';
+          : hit.keyword == 'valkyrie'
+              ? 'Valkyrie  ${hit.speaker}  ${hit.score.toStringAsFixed(2)}  say open/close/hug/home/stop/flap'
+              : 'Heard ${hit.keyword}  ${hit.speaker}  ${hit.score.toStringAsFixed(2)}'
+                  '${hit.speakerOk ? "" : "  SPEAKER NO"}';
     });
     if (!fire) return;
-    if (!hit.speakerOk || hit.keyword.isEmpty) return;
+    if (!hit.speakerOk || hit.keyword.isEmpty || hit.keyword == 'valkyrie') {
+      return;
+    }
     if (hit.keyword == 'stop') {
       await _actions.stop();
       return;
@@ -619,14 +616,20 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
             _chip(WingPose.name(s?.pose ?? 0), Colors.cyan),
             if (s?.pathActive == true) _chip('MOVING', Colors.orange),
             _chip('$_speedPct%', Colors.amber),
-            _chip('${_accelMs}ms', Colors.amber),
           ],
         ),
         const SizedBox(height: 12),
         _speedOverride(),
-        const SizedBox(height: 12),
-        _accelOverride(),
         const SizedBox(height: 16),
+        SizedBox(
+          height: 48,
+          width: double.infinity,
+          child: FilledButton(
+            onPressed: () => _actions.armAll(),
+            child: const Text('ARM ALL  SH → ER → EH → WR → WH'),
+          ),
+        ),
+        const SizedBox(height: 8),
         Row(
           children: [
             Expanded(
@@ -658,7 +661,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               child: FilledButton(
                 style: FilledButton.styleFrom(backgroundColor: Colors.deepOrange),
                 onPressed: () => _actions.home(),
-                child: const Text('D SLOW CLOSE'),
+                child: const Text('D ARM / SLOW CLOSE'),
               ),
             ),
           ],
@@ -737,7 +740,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         const SizedBox(height: 8),
         if (tgt != null)
           Text(
-            'Commanded ${tgt} µs   act ${_status?.actual[_setupCh] ?? "—"}',
+            'Commanded $tgt µs   act ${_status?.actual[_setupCh] ?? "—"}',
             style: const TextStyle(color: Colors.white70),
           ),
         const SizedBox(height: 8),
@@ -779,8 +782,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               : '+ should be more open'),
           value: _poses.sense[_setupCh] != 0,
           onChanged: (v) async {
-            setState(() => _poses.sense[_setupCh] = v ? 1 : 0);
             await _ble.setSense(_setupCh, v);
+            await Future<void>.delayed(const Duration(milliseconds: 200));
+            await _syncFromBoard();
           },
         ),
         const SizedBox(height: 8),
@@ -796,7 +800,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
           ],
         ),
         Text(
-          'Taught  C ${_poses.closed[_setupCh]}  O ${_poses.open[_setupCh]}  H ${_poses.hug[_setupCh]}',
+          _posesFromBoard
+              ? 'Taught  C ${_poses.closed[_setupCh]}  O ${_poses.open[_setupCh]}  H ${_poses.hug[_setupCh]}'
+              : 'Taught  —  (not loaded from board)',
           style: const TextStyle(color: Colors.white70),
         ),
         const SizedBox(height: 16),
@@ -832,24 +838,20 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         FilledButton(
           onPressed: () async {
             await _ble.writeCal(_cal);
-            await _ble.writePoses(_poses);
+            await Future<void>.delayed(const Duration(milliseconds: 80));
+            await _syncFromBoard();
             if (mounted) {
               ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Cal + poses saved to NVS')),
+                const SnackBar(
+                  content: Text('Envelope saved. Taught poses left as on the board.'),
+                ),
               );
             }
           },
-          child: const Text('WRITE CAL + POSES'),
+          child: const Text('WRITE CAL'),
         ),
         OutlinedButton(
-          onPressed: () async {
-            final r = await _ble.readCal();
-            final p = await _ble.readPoses();
-            setState(() {
-              if (r.length == 5) _cal = r;
-              if (p != null) _poses = p;
-            });
-          },
+          onPressed: _syncFromBoard,
           child: const Text('RELOAD FROM BOARD'),
         ),
       ],
@@ -858,18 +860,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
   Future<void> _teach(int pose) async {
     await _ble.teachPose(_setupCh, pose);
-    final tgt = _status?.target[_setupCh];
-    if (tgt != null) {
-      setState(() {
-        if (pose == WingPose.open) {
-          _poses.open[_setupCh] = tgt;
-        } else if (pose == WingPose.hug) {
-          _poses.hug[_setupCh] = tgt;
-        } else {
-          _poses.closed[_setupCh] = tgt;
-        }
-      });
-    }
+    // Teach is queued onto the loop task; NVS save follows. Do not stamp from
+    // status — that can lag and is what overwrote NVS via WRITE CAL + POSES.
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+    await _syncFromBoard();
   }
 
   void _limitFromCurrent(void Function(int us) apply) {
@@ -884,7 +878,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       MapEntry('A Open/Close', CmdId.toggleWing),
       MapEntry('B Hug', CmdId.toggleWrist),
       MapEntry('C Flap', CmdId.seq),
-      MapEntry('D Slow close', CmdId.home),
+      MapEntry('D Arm or slow close', CmdId.home),
+      MapEntry('Arm all', CmdId.armAll),
       MapEntry('Disarm all', CmdId.disarm),
     ];
     final bottom = MediaQuery.paddingOf(context).bottom;

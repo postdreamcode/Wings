@@ -15,13 +15,13 @@ void serialCmdPrintHelp() {
   Serial.println(F("=== Wings ESP32 commands ==="));
   Serial.println(F("  help              this list"));
   Serial.println(F("  status            dump state"));
-  Serial.println(F("  arm               BENCH only: seq SH ER EH WR WH this board"));
+  Serial.println(F("  arm               ARM ALL this board: SH ER EH WR WH"));
   Serial.println(F("  arm <ch>          SETUP pulse to taught CLOSED, then brake"));
   Serial.println(F("  disarm / disarm <ch>"));
-  Serial.println(F("  home              D: unhug then close (1/4, force-arm)"));
+  Serial.println(F("  home              D: COLD=ARM ALL; live=STOP then slow close"));
   Serial.println(F("  open / close / hug   absolute pose (path + brake)"));
   Serial.println(F("  stop              abort path, keep last µs, detach"));
-  Serial.println(F("  seq               C flap: hug ±10° about center, wrist lags"));
+  Serial.println(F("  seq               C flap: ± about closed, elbow toward hug, wrist opposite"));
   Serial.println(F("  jog <ch> <dus>    eased; + = more open/hug after sense"));
   Serial.println(F("  set <ch> <us>     absolute target µs"));
   Serial.println(F("  teach <ch> closed|open|hug"));
@@ -139,8 +139,8 @@ static void handleLine(String line) {
       int16_t p[1] = { (int16_t)ch };
       buttonDispatch(BTN_SERIAL, CMD_ARM, p, 1);
     } else {
-      servosArm();
-      Serial.println(F("ARM seq this board only (not BLE / not NOW)"));
+      buttonDispatch(BTN_SERIAL, CMD_ARM_ALL, nullptr, 0);
+      Serial.println(F("ARM ALL queued (STOP aborts)"));
     }
   } else if (cmd == "disarm") {
     int ch = -1;
@@ -180,15 +180,16 @@ static void handleLine(String line) {
       Serial.println(F("pose must be closed|open|hug"));
       return;
     }
-    servosTeachPose((uint8_t)ch, p);
+    int16_t pl[2] = { (int16_t)ch, (int16_t)p };
+    buttonDispatch(BTN_SERIAL, CMD_TEACH_POSE, pl, 2);
   } else if (cmd == "sense") {
     int ch = 0, s = 0;
     if (sscanf(rest.c_str(), "%d %d", &ch, &s) != 2) {
       Serial.println(F("usage: sense <ch> <0|1>"));
       return;
     }
-    servosSetSense((uint8_t)ch, s != 0);
-    Serial.printf("sense %d = %d\n", ch, s != 0);
+    int16_t pl[2] = { (int16_t)ch, (int16_t)(s != 0) };
+    buttonDispatch(BTN_SERIAL, CMD_SET_SENSE, pl, 2);
   } else if (cmd == "speed") {
     int pct = 0;
     if (sscanf(rest.c_str(), "%d", &pct) != 1) {

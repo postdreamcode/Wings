@@ -9,10 +9,10 @@ enum ButtonSrc : uint8_t {
   BTN_NOW
 };
 
-// Motion only — same function every comm path ends on.
-void buttonExec(CmdId cmd, const int16_t* payload, uint8_t len);
-
-// BLE / fob / serial: if Master has a saved peer (sync), send the button
-// over ESP-NOW first, then exec locally. Slave BLE is exec only.
-// ESP-NOW recv must call buttonExec, not this (no re-send).
+// Any task, including NimBLE and ESP-NOW recv. Copies the request and
+// returns. Does not run motion, resolve pair cmds, or touch a pad.
 void buttonDispatch(ButtonSrc src, CmdId cmd, const int16_t* payload, uint8_t len);
+
+// Loop task only. Drains the queue, broadcasts on Master+sync, then runs
+// the command. Call once per loop, before servosService.
+void buttonService();

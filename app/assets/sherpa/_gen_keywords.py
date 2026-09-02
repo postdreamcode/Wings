@@ -28,24 +28,22 @@ print("official match", ok)
 if not ok:
     raise SystemExit(1)
 
+# (phrase, alias, boost, threshold) — close is a bit harder so it
+# does not steal a weak "open".
 phrases = [
-    ("VALKYRIE", "wake"),
-    ("OPEN", "c_open"),
-    ("CLOSE", "c_close"),
-    ("HUG", "c_hug"),
-    ("HOME", "c_home"),
-    ("STOP", "c_stop"),
-    ("VALKYRIE OPEN", "open"),
-    ("VALKYRIE CLOSE", "close"),
-    ("VALKYRIE HUG", "hug"),
-    ("VALKYRIE HOME", "home"),
-    ("VALKYRIE STOP", "stop"),
+    ("VALKYRIE", "wake", "2.2", "0.14"),
+    ("OPEN", "c_open", "2.0", "0.16"),
+    ("CLOSE", "c_close", "2.0", "0.18"),
+    ("HUG", "c_hug", "2.0", "0.16"),
+    ("HOME", "c_home", "2.0", "0.16"),
+    ("STOP", "c_stop", "2.0", "0.16"),
+    ("FLAP", "c_flap", "2.0", "0.16"),
 ]
 # Official file is uppercase raw phrases
 lines = []
-for ph, alias in phrases:
+for ph, alias, boost, thr in phrases:
     toks = encode_phrase(ph)
-    line = " ".join(toks) + f" @{alias}"
+    line = " ".join(toks) + f" :{boost} #{thr} @{alias}"
     lines.append(line)
 
 out = Path(r"d:\Personal\Wings\app\assets\sherpa\keywords.txt")

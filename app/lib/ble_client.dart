@@ -172,6 +172,7 @@ class WingsBle {
     });
     _backoffMs = 1200;
     readyController.add(true);
+    unawaited(setLinkPriority(high: false));
   }
 
   void _scheduleReconnect() {
@@ -226,12 +227,28 @@ class WingsBle {
     if (_cmd == null) {
       throw StateError('Not connected');
     }
+    // Don't wait for the connection-interval bump. Low-power idle makes
+    // requestConnectionPriority + write-with-response sit for hundreds of ms
+    // after the ok chime.
+    unawaited(setLinkPriority(high: true));
     final bytes = <int>[cmd & 0xff, ...?payload];
     try {
-      await _cmd!.write(bytes, withoutResponse: false);
-    } catch (_) {
       await _cmd!.write(bytes, withoutResponse: true);
+    } catch (_) {
+      await _cmd!.write(bytes, withoutResponse: false);
     }
+  }
+
+  /// HIGH around a write/move; lowPower while idle+listening. Ignore failures.
+  Future<void> setLinkPriority({required bool high}) async {
+    final d = device;
+    if (d == null) return;
+    try {
+      await d.requestConnectionPriority(
+        connectionPriorityRequest:
+            high ? ConnectionPriority.high : ConnectionPriority.lowPower,
+      );
+    } catch (_) {}
   }
 
   Future<void> jog(int ch, int deltaUs) async {
@@ -329,13 +346,6 @@ class WingsBle {
     if (p < 1) p = 1;
     if (p > 100) p = 100;
     await sendCmd(CmdId.setChSpeed, [ch & 0xff, p & 0xff]);
-  }
-
-  Future<void> setAccel(int ms) async {
-    var v = ms;
-    if (v < kAccelMsMin) v = kAccelMsMin;
-    if (v > kAccelMsMax) v = kAccelMsMax;
-    await sendCmd(CmdId.setAccel, [v & 0xff, (v >> 8) & 0xff]);
   }
 
   void dispose() {

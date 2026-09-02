@@ -18,11 +18,11 @@ static unsigned long g_lastSeenMs = 0;
 static unsigned long g_lastHelloMs = 0;
 static unsigned long g_lastPingMs = 0;
 static uint32_t g_rxCount = 0;
-static bool g_emuPending = false;
-static CmdId g_emuCmd = CMD_NONE;
-static int16_t g_emuPayload[NUM_SERVOS] = {};
-static uint8_t g_emuLen = 0;
-static uint8_t g_emuSeq = 0;
+static uint8_t g_lastSeq = 0;
+static bool g_haveSeq = false;
+static bool g_havePeerState = false;
+static uint8_t g_peerBrakeReady = 0;
+static uint8_t g_peerCycledMask = 0;
 
 static bool macZero(const uint8_t m[6]) {
   for (int i = 0; i < 6; i++) {
@@ -94,8 +94,12 @@ static void noteSeen(const uint8_t* mac) {
 static void sendAck(const uint8_t dest[6], uint8_t seq, uint8_t cmd) {
   if (!g_ready || !dest) return;
   NowPacket pkt;
-  int16_t p[1] = { (int16_t)cmd };
-  fillPacket(pkt, NOW_CMD_ACK, p, 1);
+  int16_t p[3] = {
+    (int16_t)cmd,
+    (int16_t)(servosIsBrakeReady() ? 1 : 0),
+    (int16_t)servosCycledMask()
+  };
+  fillPacket(pkt, NOW_CMD_ACK, p, 3);
   pkt.seq = seq;
   pkt.crc = xorCrc((const uint8_t*)&pkt, sizeof(pkt) - 1);
   ensurePeer(dest);
@@ -118,12 +122,30 @@ static void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
   g_rxCount++;
 
   if (pkt.cmd == NOW_CMD_HELLO || pkt.cmd == NOW_CMD_ACK) {
-    if (roleIsMaster()) noteSeen(mac);
+    if (roleIsMaster()) {
+      noteSeen(mac);
+      if (pkt.cmd == NOW_CMD_HELLO && pkt.len >= 2) {
+        g_peerBrakeReady = (uint8_t)pkt.payload[0];
+        g_peerCycledMask = (uint8_t)pkt.payload[1];
+        g_havePeerState = true;
+      } else if (pkt.cmd == NOW_CMD_ACK && pkt.len >= 3) {
+        g_peerBrakeReady = (uint8_t)pkt.payload[1];
+        g_peerCycledMask = (uint8_t)pkt.payload[2];
+        g_havePeerState = true;
+      }
+    }
     return;
   }
 
   if (pkt.cmd == NOW_CMD_PING) {
-    if (!roleIsMaster() && mac) sendAck(mac, pkt.seq, pkt.cmd);
+    if (!roleIsMaster()) {
+      // Master's live speed, not a motion command. Enqueue so the loop applies it.
+      if (pkt.len >= 1 && pkt.payload[0] >= 1 && pkt.payload[0] <= 100) {
+        int16_t p = pkt.payload[0];
+        buttonDispatch(BTN_NOW, CMD_SET_SPEED, &p, 1);
+      }
+      if (mac) sendAck(mac, pkt.seq, pkt.cmd);
+    }
     return;
   }
 
@@ -135,15 +157,15 @@ static void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
     return;
   }
 
-  // Queue one button. Motion runs in nowService() on loop — same as BLE.
-  if (g_emuPending && g_emuSeq == pkt.seq) return;
-  g_emuCmd = (CmdId)pkt.cmd;
-  g_emuLen = pkt.len;
-  if (g_emuLen > NUM_SERVOS) g_emuLen = NUM_SERVOS;
-  memcpy(g_emuPayload, pkt.payload, sizeof(g_emuPayload));
-  g_emuSeq = pkt.seq;
-  g_emuPending = true;
+  // Recv is not the loop task. Enqueue; buttonService runs it.
+  if (g_haveSeq && g_lastSeq == pkt.seq) return;
+  g_lastSeq = pkt.seq;
+  g_haveSeq = true;
+  uint8_t n = pkt.len;
+  if (n > NUM_SERVOS) n = NUM_SERVOS;
+  buttonDispatch(BTN_NOW, (CmdId)pkt.cmd, n ? pkt.payload : nullptr, n);
   Serial.printf("ESP-NOW button cmd=%u seq=%u\n", (unsigned)pkt.cmd, pkt.seq);
+  if (mac) sendAck(mac, pkt.seq, pkt.cmd);
 }
 
 static bool isBroadcast(const uint8_t* mac) {
@@ -198,6 +220,9 @@ void nowBegin() {
 
   memcpy(g_peerMac, storeData().peerMac, 6);
   g_hasPeer = !macZero(g_peerMac);
+  g_havePeerState = false;
+  g_peerBrakeReady = 0;
+  g_peerCycledMask = 0;
   if (g_hasPeer) {
     memcpy(g_heardMac, g_peerMac, 6);
     ensurePeer(g_peerMac);
@@ -247,25 +272,20 @@ uint8_t nowWifiChannel() {
 
 void nowService() {
   if (!g_ready) return;
-  if (g_emuPending) {
-    g_emuPending = false;
-    Serial.printf("ESP-NOW emulate cmd=%u\n", (unsigned)g_emuCmd);
-    buttonExec(g_emuCmd, g_emuPayload, g_emuLen);
-  }
-  if (servosAttachMask() != 0) return;
-  lockChannel();
   if (g_paused) return;
+  if (servosAttachMask() == 0) lockChannel();
   unsigned long now = millis();
   const uint8_t bcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
   if (roleIsMaster()) {
     if (now - g_lastPingMs < NOW_HELLO_MS) return;
     g_lastPingMs = now;
+    int16_t spd[1] = { (int16_t)servosGetSpeedPct() };
     NowPacket pkt;
-    fillPacket(pkt, NOW_CMD_PING, nullptr, 0);
+    fillPacket(pkt, NOW_CMD_PING, spd, 1);
     esp_now_send(bcast, (uint8_t*)&pkt, sizeof(pkt));
     if (g_hasPeer) {
       ensurePeer(g_peerMac);
-      fillPacket(pkt, NOW_CMD_PING, nullptr, 0);
+      fillPacket(pkt, NOW_CMD_PING, spd, 1);
       esp_now_send(g_peerMac, (uint8_t*)&pkt, sizeof(pkt));
     }
     return;
@@ -273,7 +293,11 @@ void nowService() {
   if (now - g_lastHelloMs < NOW_HELLO_MS) return;
   g_lastHelloMs = now;
   NowPacket pkt;
-  fillPacket(pkt, NOW_CMD_HELLO, nullptr, 0);
+  int16_t st[2] = {
+    (int16_t)(servosIsBrakeReady() ? 1 : 0),
+    (int16_t)servosCycledMask()
+  };
+  fillPacket(pkt, NOW_CMD_HELLO, st, 2);
   esp_now_send(bcast, (uint8_t*)&pkt, sizeof(pkt));
 }
 
@@ -342,6 +366,10 @@ uint8_t nowSlaveAgeCs() {
   return (uint8_t)age;
 }
 
+bool nowHavePeerState() { return g_havePeerState; }
+bool nowPeerBrakeReady() { return g_peerBrakeReady != 0; }
+uint8_t nowPeerCycledMask() { return g_peerCycledMask; }
+
 void nowPause(bool paused) { g_paused = paused; }
 bool nowIsPaused() { return g_paused; }
 
@@ -357,6 +385,11 @@ void nowBroadcastCmd(CmdId cmd, const int16_t* payload, uint8_t len) {
 
   const uint8_t bcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
   esp_err_t e = esp_now_send(bcast, (uint8_t*)&pkt, sizeof(pkt));
+  if (g_hasPeer) {
+    ensurePeer(g_peerMac);
+    esp_err_t u = esp_now_send(g_peerMac, (uint8_t*)&pkt, sizeof(pkt));
+    if (u == ESP_OK) e = ESP_OK;
+  }
   if (e != ESP_OK) {
     Serial.println(F("ESP-NOW: send error — local button already ran"));
   }

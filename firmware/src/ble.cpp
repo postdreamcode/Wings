@@ -68,37 +68,73 @@ class CmdCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c) override {
     std::string v = c->getValue();
     if (v.size() < 1) return;
-    CmdId cmd = (CmdId)(uint8_t)v[0];
+    const CmdId cmd = (CmdId)(uint8_t)v[0];
     int16_t payload[NUM_SERVOS] = {};
     uint8_t plen = 0;
-    // Parse by command id first. A padded write (>=11 bytes) used to
-    // look like SET_TARGETS and slam every channel.
-    if (cmd == CMD_JOG && v.size() >= 4) {
-      payload[0] = (uint8_t)v[1];
-      payload[1] = (int16_t)((uint8_t)v[2] | ((uint8_t)v[3] << 8));
-      plen = 2;
-      Serial.printf("BLE JOG ch=%u d=%d pin=%u\n",
-                    (unsigned)payload[0], (int)payload[1],
-                    (payload[0] < NUM_SERVOS) ? SERVO_PINS[(uint8_t)payload[0]] : 99);
-    } else if ((cmd == CMD_ARM || cmd == CMD_DISARM) && v.size() == 2 &&
-               (uint8_t)v[1] < NUM_SERVOS) {
-      // Exactly cmd+ch. No-channel ARM is ignored (not a 5-servo seq).
-      payload[0] = (uint8_t)v[1];
-      plen = 1;
-    } else if (cmd == CMD_SET_SPEED && v.size() >= 2) {
-      payload[0] = (uint8_t)v[1];
-      plen = 1;
-    } else if (cmd == CMD_SET_CH_SPEED && v.size() >= 3) {
-      payload[0] = (uint8_t)v[1];
-      payload[1] = (uint8_t)v[2];
-      plen = 2;
-    } else if ((cmd == CMD_TEACH_POSE || cmd == CMD_SET_SENSE) && v.size() >= 3) {
-      payload[0] = (uint8_t)v[1];
-      payload[1] = (uint8_t)v[2];
-      plen = 2;
-    } else if (cmd == CMD_SET_TARGETS) {
-      Serial.println(F("BLE SET_TARGETS ignored"));
-      return;
+
+    /*
+      This callback runs on the NimBLE host task, on the other core. It may
+      parse and enqueue. It must not call servosHandleCmd, attach, or
+      sdCommand. buttonDispatch copies an enum (or a setup payload) and
+      returns; buttonService on the loop task is the only runner.
+
+      Motion writes are the cmd byte. Extra bytes are ignored, never treated
+      as positions — a padded write used to look like SET_TARGETS and slam
+      every channel. Setup still carries a channel or a delta.
+    */
+    switch (cmd) {
+      case CMD_SET_TARGETS:
+        Serial.println(F("BLE SET_TARGETS ignored"));
+        return;
+      case CMD_SET_ACCEL:
+        return;
+      case CMD_ARM_ALL:
+        break;
+      case CMD_ARM:
+        if (v.size() == 2 && (uint8_t)v[1] < NUM_SERVOS) {
+          payload[0] = (uint8_t)v[1];
+          plen = 1;
+        } else {
+          Serial.println(F("BLE ARM ignore — need ch 0-4"));
+          return;
+        }
+        break;
+      case CMD_DISARM:
+        if (v.size() == 2 && (uint8_t)v[1] < NUM_SERVOS) {
+          payload[0] = (uint8_t)v[1];
+          plen = 1;
+        }
+        break;
+      case CMD_JOG:
+        if (v.size() < 4) return;
+        payload[0] = (uint8_t)v[1];
+        payload[1] = (int16_t)((uint8_t)v[2] | ((uint8_t)v[3] << 8));
+        plen = 2;
+        Serial.printf("BLE JOG ch=%u d=%d pin=%u\n",
+                      (unsigned)payload[0], (int)payload[1],
+                      (payload[0] < NUM_SERVOS) ? SERVO_PINS[(uint8_t)payload[0]] : 99);
+        break;
+      case CMD_SET_SPEED:
+        if (v.size() < 2) return;
+        payload[0] = (uint8_t)v[1];
+        plen = 1;
+        break;
+      case CMD_SET_CH_SPEED:
+        if (v.size() < 3) return;
+        payload[0] = (uint8_t)v[1];
+        payload[1] = (uint8_t)v[2];
+        plen = 2;
+        break;
+      case CMD_TEACH_POSE:
+      case CMD_SET_SENSE:
+        if (v.size() < 3) return;
+        payload[0] = (uint8_t)v[1];
+        payload[1] = (uint8_t)v[2];
+        plen = 2;
+        break;
+      default:
+        // HOME / TOGGLE / SEQ / POSE_* / STOP — cmd byte only.
+        break;
     }
     Serial.printf("BLE cmd=%u len=%u\n", (unsigned)cmd, (unsigned)v.size());
     buttonDispatch(BTN_BLE, cmd, plen ? payload : nullptr, plen);
@@ -107,6 +143,8 @@ class CmdCallbacks : public NimBLECharacteristicCallbacks {
 
 class CalCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c) override {
+    // Config only — no attach. Command writes are the ones that must not
+    // run here; they go through buttonDispatch onto the loop task.
     std::string v = c->getValue();
     if (v.size() < sizeof(ChannelCal) * NUM_SERVOS) return;
     const ChannelCal* cal = (const ChannelCal*)v.data();

@@ -13,6 +13,7 @@
 #include "now.h"
 #include "ble.h"
 #include "serial_cmd.h"
+#include "button.h"
 
 void setup() {
   Serial.begin(115200);
@@ -54,6 +55,7 @@ void loop() {
   serialCmdService();
   remoteService();
   nowService();
+  buttonService();
   servosService();
   bleService();
 }

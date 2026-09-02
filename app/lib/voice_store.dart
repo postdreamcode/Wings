@@ -34,7 +34,7 @@ class VoiceStore {
   bool live = false;
   bool alwaysListen = false;
   bool debugBypass = false;
-  double threshold = 0.50;
+  double threshold = 0.35;
 
   Future<void> load() async {
     final f = File(_path);
@@ -43,7 +43,9 @@ class VoiceStore {
     live = j['live'] == true;
     alwaysListen = j['alwaysListen'] == true;
     debugBypass = j['debugBypass'] == true;
-    threshold = (j['threshold'] as num?)?.toDouble() ?? 0.50;
+    threshold = (j['threshold'] as num?)?.toDouble() ?? 0.35;
+    // 0.50 was the old default and rejects HFP/earpiece Valkyrie.
+    if (threshold >= 0.49) threshold = 0.35;
     profiles
       ..clear()
       ..addAll(
@@ -63,6 +65,7 @@ class VoiceStore {
         'threshold': threshold,
         'profiles': profiles.map((p) => p.toJson()).toList(),
       }),
+      flush: true,
     );
   }
 }

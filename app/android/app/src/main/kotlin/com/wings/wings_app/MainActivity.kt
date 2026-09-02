@@ -19,7 +19,7 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         EventChannel(flutterEngine.dartExecutor.binaryMessenger, "wings/mic")
-            .setStreamHandler(WingsMic())
+            .setStreamHandler(WingsMic(this))
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
@@ -81,6 +81,14 @@ class MainActivity : FlutterActivity() {
                                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                         )
                         result.success(null)
+                    }
+                    "chime" -> {
+                        val kind = call.argument<String>("kind") ?: "no"
+                        WingsChime.play(this, kind)
+                        result.success(null)
+                    }
+                    "micRoute" -> {
+                        result.success(WingsMic.route)
                     }
                     else -> result.notImplemented()
                 }

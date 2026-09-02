@@ -54,8 +54,11 @@ Connect screen shows **app version** and **expected firmware protocol** (2).
 | 11 | TEACH_POSE |
 | 12 | SET_SENSE |
 
+| 17 | SET_CH_SPEED |
+| 18 | ARM_ALL (SH ER EH WR WH) |
+
 ## Tabs
 
-- **RUN** — A/B/C/D, STOP, live µs (no ARM; home each servo on SETUP first)
+- **RUN** — ARM ALL, A/B/C/D, STOP, speed. Accel slider removed (cosine ease; firmware ignores SET_ACCEL).
 - **SETUP** — per-channel ARM/DISARM, jog, sense, SET CLOSED/OPEN/HUG, soft/hard envelope
 - **FOB** — command map (codes already learned on Master)

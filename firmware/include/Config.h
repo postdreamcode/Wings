@@ -86,6 +86,9 @@ static const uint8_t SERVO_PINS[NUM_SERVOS] = {
 #define ARRIVE_US         25
 #define SPEED_SCALE_PCT   10
 #define SETUP_IDLE_DETACH_MS 200  // one clean frame after arrival, then brake
+#define ARM_SEQ_GAP_MS        400  // pause after each ARM-all stage before the next
+#define ARM_CATCHUP_MS        800  // gap between catch-up ARM+ch
+#define ARM_CATCHUP_MAX       15   // 5 ch × 3; ~12 s then stop (slave reboot starts a new window)
 #define ATTACH_STAGGER_MS 150  // D dwell only; RUN open/close attaches the group at once
 #define MIN_STAGE_HOLD_MS 250  // visible pulse before Vin-brake, even if already there
 
@@ -100,11 +103,14 @@ static const uint8_t SERVO_PINS[NUM_SERVOS] = {
 #define RAMP_ACCEL_MAX_MS        2000
 
 // ---------- Sequence (C flap) ----------
-// Hug pair only, from OPEN. ±SEQ_FLAP_DEG about cal.center.
-// Hug pose is "forward". Wrist lags elbow.
-// Strokes go extreme-to-extreme through center (no stop at center).
+// Hug pair only, from OPEN (hugs at taught CLOSED). ±SEQ_FLAP_DEG about
+// CLOSED, not cal.center. Elbow first stroke is toward hug; wrist is the
+// opposite sign so the pair counters. Wrist travel is SEQ_FLAP_WRIST_MULT
+// times the elbow. Equal back past closed. Ends at CLOSED.
+// Strokes go extreme-to-extreme through closed (no stop at closed).
 #define SEQ_FLAP_CYCLES        4
 #define SEQ_FLAP_DEG           15
+#define SEQ_FLAP_WRIST_MULT    2
 #define SEQ_FLAP_WRIST_LAG_MS  150
 #define SEQ_HOLD_MS            0
 #define SEQ_SHOULDER_BREATH_US 40

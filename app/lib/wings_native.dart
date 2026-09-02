@@ -52,4 +52,14 @@ class WingsNative {
   Future<void> openBluetoothSettings() async {
     await _ch.invokeMethod('openBluetoothSettings');
   }
+
+  /// Earpiece/HFP beep: `wake`, `ok`, or `no`.
+  Future<void> chime(String kind) async {
+    await _ch.invokeMethod('chime', {'kind': kind});
+  }
+
+  /// Active capture path: headset product name, `headset`, or `phone`.
+  Future<String> micRoute() async {
+    return await _ch.invokeMethod<String>('micRoute') ?? 'phone';
+  }
 }

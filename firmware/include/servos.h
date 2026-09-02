@@ -38,14 +38,15 @@ void servosBegin();
 void servosApplyDefaults();
 bool servosIsArmed();       // LIVE: PWM attached
 bool servosIsBrakeReady();  // this boot: all 5 have attach→home→detach
-void servosArm();  // serial bench only: seq SH ER EH WR WH
+uint8_t servosCycledMask(); // bit i: attach→closed→detach this boot
+void servosArm();  // SH → ER → EH → WR → WH to taught CLOSED; STOP aborts
 void servosArmCh(uint8_t ch);  // SETUP: one channel to taught CLOSED, then brake
 void servosDisarm();
 void servosDisarmCh(uint8_t ch);
 uint8_t servosAttachMask();
 void servosAlignActualToTargets();
 void servosApplyLastCmd(const int16_t us[NUM_SERVOS]);
-void servosHome(bool forceArm);  // D: unhug then close, quarter speed
+void servosHome(bool forceArm);  // COLD: ARM ALL. Live: STOP then slow close.
 void servosService();
 
 // Motion-path diagnostic ring. Records pad state and pulse timing at every
@@ -81,10 +82,11 @@ void applyPoseHug();
 
 void cmdToggleWing();   // A
 void cmdHug();          // B
-void startSequence();   // C flap: hug ±10° about center, wrist lags
+void startSequence();   // C flap: ± about closed, elbow toward hug, wrist opposite
 void abortPath();
-void servosStop();  // abort + snap target=actual + detach (brake)
+void servosStop();  // freeze at emitted, settle, release; nearest pose restored
 bool pathIsActive();
+bool servosMotionBusy();  // path / flap / arm-seq / STOP settling
 PathId pathGet();
 WingPose getWingPose();
 
@@ -106,7 +108,8 @@ enum CmdId : uint8_t {
   CMD_SET_ACCEL,     // RETIRED, no longer accepted; id held so later ids keep value
   CMD_STOP,          // abort path, snap target=actual, detach (brake)
   CMD_POSE_HUG,
-  CMD_SET_CH_SPEED   // payload: ch, percent 1-100
+  CMD_SET_CH_SPEED,  // payload: ch, percent 1-100
+  CMD_ARM_ALL        // SH ER EH WR WH; each step is a normal ARM+ch over ESP-NOW
 };
 
 uint8_t servosGetSpeedPct();           // saved global slider (NVS)

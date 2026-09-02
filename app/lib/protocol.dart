@@ -2,7 +2,7 @@
 library;
 
 const int kProtocolVersion = 2;
-const String kAppVersion = '1.1.24';
+const String kAppVersion = '1.1.36';
 
 /// This pair's Slave WiFi/ESP-NOW MAC. LINK uses it when Master has never heard
 /// a hello (phone on Master is often RX-deaf).
@@ -85,10 +85,11 @@ class CmdId {
   static const int teachPose = 11;
   static const int setSense = 12;
   static const int setSpeed = 13;
-  static const int setAccel = 14; // payload: uint16 LE ms
+  static const int setAccel = 14; // RETIRED; id held so later ids keep value
   static const int stop = 15;
   static const int poseHug = 16;
   static const int setChSpeed = 17; // payload: ch, percent
+  static const int armAll = 18; // SH ER EH WR WH, each step is ARM+ch
 }
 
 class WingPose {

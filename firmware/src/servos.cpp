@@ -1,6 +1,7 @@
 #include "servos.h"
 #include "Config.h"
 #include "now.h"
+#include "role.h"
 #include "store.h"
 #include "servo_driver.h"
 #include "driver/gpio.h"
@@ -30,15 +31,16 @@ static uint8_t g_cycledMask = 0; // bit i: attach→closed→detach this boot
 static bool g_brakeReady = false;
 static bool g_armSeqOn = false;
 static uint8_t g_armSeqI = 0;
+static unsigned long g_armSeqGapUntil = 0;
 static const uint8_t ARM_SEQ[NUM_SERVOS] = {
   CH_SHOULDER, CH_ELBOW1, CH_ELBOW2, CH_WRIST1, CH_WRIST2
 };
 static bool g_flapOn = false;
 static bool g_flapPending = false;
 static uint8_t g_flapCycle = 0;
-static uint8_t g_flapStep = 0;  // 0 fwd 1 back (through center)
-static bool g_flapPreamble = false;  // first move to center
-static bool g_flapHome = false;      // last move to center
+static uint8_t g_flapStep = 0;  // 0 first stroke, 1 opposite (through closed)
+static bool g_flapPreamble = false;
+static bool g_flapHome = false;      // last move back to closed (start)
 static unsigned long g_flapWristAt = 0;
 static bool g_flapWristGo = false;
 static unsigned long g_flapHoldUntil = 0;
@@ -82,6 +84,9 @@ static uint8_t g_jogMask = 0;
 static int g_jogFrom[NUM_SERVOS];
 static unsigned long g_jogT0[NUM_SERVOS];
 static uint32_t g_jogDur[NUM_SERVOS];
+static uint8_t g_pendingRelease = 0;  // settle, then sdDetach
+static bool g_stopping = false;       // STOP in flight; pose unknown until HOME
+static bool g_homeAfterStop = false;  // D pressed during STOP settle — run after release
 
 // RUN-path cosine ease (commanded µs). Frozen at group attach-complete.
 static int g_rampFrom[NUM_SERVOS];
@@ -174,6 +179,7 @@ static float cosineFrac(uint32_t elapsed, uint32_t dur) {
 void servosSetSpeedPct(uint8_t pct) {
   if (pct < 1) pct = 1;
   if (pct > 100) pct = 100;
+  if (g_speedScalePct == pct) return;
   g_speedScalePct = pct;
   Serial.printf("SPEED %u%%%s\n", (unsigned)g_speedScalePct,
                 g_brakeReady ? "" : " (COLD crawl 10%)");
@@ -310,6 +316,7 @@ void abortPath() {
   g_flapOn = false;
   g_flapPending = false;
   g_armSeqOn = false;
+  g_armSeqGapUntil = 0;
   /*
     Derived, never asserted. startRunMotion sets g_armed optimistically before the
     first stage attaches, so an aborted kick would otherwise report ARMED with
@@ -318,6 +325,28 @@ void abortPath() {
     (STOP, DISARM) re-derive afterwards.
   */
   g_armed = (sdAttachMask() != 0);
+}
+
+static void freezeAttachedToWritten(uint8_t keepMask) {
+  for (uint8_t i = 0; i < NUM_SERVOS; i++) {
+    if (!sdAttached(i)) continue;
+    if (keepMask & (1u << i)) continue;
+    const int w = sdWritten(i);
+    g_actual[i] = w;
+    g_target[i] = w;
+    sdCommand(i, w);
+    g_pendingRelease |= (1u << i);
+    g_jogMask &= (uint8_t)~(1u << i);
+    g_setupIdleAt[i] = 0;
+  }
+}
+
+// Drop the path, then mark leftover live pads to settle and release. keepMask
+// channels stay under the caller's control (jog / arm this one).
+static void abortAndReleaseExcept(uint8_t keepMask) {
+  abortPath();
+  freezeAttachedToWritten(keepMask);
+  g_pendingRelease &= (uint8_t)~keepMask;
 }
 
 static bool chAttached(uint8_t ch) { return sdAttached(ch); }
@@ -366,6 +395,9 @@ void servosBegin() {
   g_brakeReady = false;
   g_poseKnown = false;
   g_jogMask = 0;
+  g_pendingRelease = 0;
+  g_stopping = false;
+  g_homeAfterStop = false;
   g_flapOn = false;
   g_flapPending = false;
   g_flapPreamble = false;
@@ -391,9 +423,13 @@ void servosBegin() {
 ChannelCal& servosCal(uint8_t ch) { return g_cal[ch]; }
 bool servosIsArmed() { return g_armed; }
 bool servosIsBrakeReady() { return g_brakeReady; }
+uint8_t servosCycledMask() { return g_cycledMask; }
 uint8_t servosAttachMask() { return sdAttachMask(); }
 WingPose getWingPose() { return g_pose; }
-bool pathIsActive() { return g_path != PATH_NONE || g_flapOn || g_armSeqOn; }
+bool pathIsActive() {
+  return g_path != PATH_NONE || g_flapOn || g_armSeqOn || g_stopping;
+}
+bool servosMotionBusy() { return pathIsActive(); }
 PathId pathGet() { return g_path; }
 
 int servosGetTarget(uint8_t ch) {
@@ -468,7 +504,7 @@ static void startJogEase(uint8_t ch) {
 
 void servosJog(uint8_t ch, int deltaUs) {
   if (ch >= NUM_SERVOS) return;
-  abortPath();
+  abortAndReleaseExcept((uint8_t)(1u << ch));
   int signedDelta = g_sense[ch] ? deltaUs : -deltaUs;
   if (!chAttached(ch)) g_target[ch] = g_actual[ch];
   servosSetTarget(ch, g_target[ch] + signedDelta);
@@ -748,10 +784,9 @@ static bool attachStageTogether(int g) {
     timer, so they all go live on the same frame. Normally one frame, ~20 ms.
 
     Spun without yielding on purpose. The duty register is copied by hardware at
-    the frame boundary, so nothing here needs sdService to run, and yielding would
-    widen the window in which a BLE motion command — still handled on the NimBLE
-    task, on the other core — could land between this prepare and the handover
-    below. That race closes when the command sources are queued onto the loop task.
+    the frame boundary, so nothing here needs sdService to run. Commands now
+    enqueue onto the loop task, so a BLE write cannot land inside this window;
+    yielding would still delay the handover for no gain on the latch.
   */
   const uint32_t t0 = millis();
   for (;;) {
@@ -837,6 +872,8 @@ static void seqAdd3(uint8_t a, uint8_t b, uint8_t c) {
 }
 
 static bool chNeedsMove(uint8_t ch);
+static int destUsForPose(uint8_t ch, WingPose pose);
+static void adoptNearestPose();
 
 // Open/close: all three raises together (WR+ER+SH). Hugs stay a pair.
 // D force-dwell: hugs one-at-a-time, then the three raises together.
@@ -860,16 +897,22 @@ static void buildSeq() {
     if (chNeedsMove(CH_WRIST2) || chNeedsMove(CH_ELBOW2))
       seqAdd2(CH_WRIST2, CH_ELBOW2);
     seqAdd3(CH_WRIST1, CH_ELBOW1, CH_SHOULDER);
-  } else if (closeLike) {
-    if (g_forceDwell) {
-      seqAdd1(CH_WRIST2);
-      seqAdd1(CH_ELBOW2);
-    } else if (chNeedsMove(CH_WRIST2) || chNeedsMove(CH_ELBOW2)) {
-      seqAdd2(CH_WRIST2, CH_ELBOW2);
+  } else   if (closeLike) {
+    // D used to force both hug channels even when already parked. Each then
+    // sat through groupDwellMs (full taught span at 1/4 speed) before the
+    // raises moved — tens of seconds of "startup" with nothing visible.
+    if (chNeedsMove(CH_WRIST2) || chNeedsMove(CH_ELBOW2)) {
+      if (g_forceDwell) {
+        if (chNeedsMove(CH_WRIST2)) seqAdd1(CH_WRIST2);
+        if (chNeedsMove(CH_ELBOW2)) seqAdd1(CH_ELBOW2);
+      } else {
+        seqAdd2(CH_WRIST2, CH_ELBOW2);
+      }
     }
     seqAdd3(CH_WRIST1, CH_ELBOW1, CH_SHOULDER);
   } else if (hugLike || unhugLike) {
-    seqAdd2(CH_WRIST2, CH_ELBOW2);
+    if (chNeedsMove(CH_WRIST2) || chNeedsMove(CH_ELBOW2))
+      seqAdd2(CH_WRIST2, CH_ELBOW2);
   }
 
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
@@ -930,6 +973,19 @@ static bool groupSettled(int g) {
   return true;
 }
 
+// True only when the driver is still slewing a LARGE step (stalled-loop catch-up).
+// sdSettled is false for up to one 20 ms frame after every duty write — that is
+// the LEDC latch, not catch-up. Holding the ramp clock for that wait paused the
+// ease ~19 ms of every 20 ms and stretched a ~1 s cosine into ~13 s wall time.
+static bool groupSlewCatchingUp(int g) {
+  for (uint8_t i = 0; i < groupCount(g); i++) {
+    const uint8_t ch = groupChAt(g, i);
+    if (ch >= NUM_SERVOS || !sdAttached(ch)) continue;
+    if (abs(sdCommanded(ch) - sdWritten(ch)) > PULSE_MAX_STEP_US) return true;
+  }
+  return false;
+}
+
 static bool groupArrived(int g) {
   for (uint8_t i = 0; i < groupCount(g); i++) {
     uint8_t ch = groupChAt(g, i);
@@ -939,13 +995,15 @@ static bool groupArrived(int g) {
 }
 
 static unsigned long groupDwellMs(int g) {
+  // Remaining commanded distance, not the full taught span. The cosine
+  // already lasts that long; using open−closed at 1/4 speed double-counted
+  // and parked D for ~14 s per hug stage after it had already arrived.
   uint32_t hold = MIN_STAGE_HOLD_MS;
   for (uint8_t i = 0; i < groupCount(g); i++) {
     uint8_t ch = groupChAt(g, i);
-    int d = abs((int)g_poseOpen[ch] - (int)g_poseClosed[ch]);
-    int dh = abs((int)g_poseHug[ch] - (int)g_poseClosed[ch]);
-    if (dh > d) d = dh;
-    uint32_t ms = cosineDurMs((uint32_t)d, cruiseUsPerSec(ch));
+    if (ch >= NUM_SERVOS) continue;
+    uint32_t d = (uint32_t)abs(g_target[ch] - g_actual[ch]);
+    uint32_t ms = cosineDurMs(d, cruiseUsPerSec(ch));
     if (ms > hold) hold = ms;
   }
   return hold;
@@ -978,13 +1036,16 @@ static void serviceCosineRamp() {
   unsigned long now = millis();
 
   /*
-    While the driver is still catching up, hold the ramp clock rather than letting
-    it run. Advancing it would put the profile ahead of the hardware, and the
-    difference would then arrive as one large step the moment the driver caught up
-    — exactly the shape of a jump. Pushing T0 forward by the skipped interval
-    preserves the ease rather than re-basing it, which would restart the curve.
+    Hold the ramp clock only while the driver is slewing a step bigger than one
+    frame's ceiling. A stalled loop can command a jump; the driver turns that
+    into 60 us/frame, and running the cosine during that catch-up would dump the
+    lag as one step.
+
+    Do not hold for sdSettled. written updates once per 20 ms frame, so
+    "not settled" is the normal latch wait after every command. Treating it as
+    catch-up paused the ease for 19 ms of every 20 ms.
   */
-  if (!groupSettled(g_group)) {
+  if (groupSlewCatchingUp(g_group)) {
     g_rampT0 += (unsigned long)(now - g_rampLastMs);
     g_rampLastMs = now;
     return;
@@ -1095,6 +1156,7 @@ static void detachAll() {
     g_setupIdleAt[i] = 0;
     releaseOnePin(i);
   }
+  g_pendingRelease = 0;
   g_lastCmdDirty = true;
 }
 
@@ -1215,6 +1277,7 @@ static void serviceGroup() {
 
 static void startRunMotion(PathId path, SpeedTier s1, SpeedTier s2, bool forceDwell) {
   g_jogMask = 0;
+  g_stopping = false;
   detachAll();  // Vin-brake leftovers so D/A/B never stack on a live raise
   startPath(path, s1, s2);
   g_runMotion = true;
@@ -1292,6 +1355,7 @@ static void finishPath() {
   bool keepFlap = g_flapPending;
   abortPath();
   g_flapPending = keepFlap;
+  g_poseKnown = true;
 }
 
 static void servicePath() {
@@ -1299,8 +1363,9 @@ static void servicePath() {
   // Do not use AllArrived here. After startPath, targets often already
   // match lastcmd (A-close at home) and a loop tick would finish
   // the path before buildSeq/kickGroup runs.
+  // nStages==0 is a skipped step (D unhug when hugs are already parked),
+  // not a stall — fall through and advance or finish.
   if (!g_runMotion) return;
-  if (g_nStages == 0) return;
   if (g_group >= 0 && g_group < (int)g_nStages) return;
 
   bool twoStage = (g_path == PATH_OPEN_THEN_HUG ||
@@ -1340,47 +1405,128 @@ static bool pulseArmCh(uint8_t ch) {
   return true;
 }
 
+// Same as a SETUP ARM tap: local pulse, and Master sends ARM+ch so Slave follows.
+static bool armSeqPulse(uint8_t ch) {
+  if (roleIsMaster()) {
+    int16_t p = (int16_t)ch;
+    nowBroadcastCmd(CMD_ARM, &p, 1);
+  }
+  return pulseArmCh(ch);
+}
+
 void servosArmCh(uint8_t ch) {
   if (ch >= NUM_SERVOS) return;
-  abortPath();
+  abortAndReleaseExcept((uint8_t)(1u << ch));
   pulseArmCh(ch);
 }
 
-// Serial bench only: SETUP pulse each job, in order. Not BLE / not fob.
 void servosArm() {
   abortPath();
   g_armSeqOn = true;
   g_armSeqI = 0;
-  Serial.println(F("ARM seq SH ER EH WR WH"));
-  if (!pulseArmCh(ARM_SEQ[0])) {
+  g_armSeqGapUntil = 0;
+  Serial.println(F("ARM ALL SH → ER → EH → WR → WH"));
+  if (!armSeqPulse(ARM_SEQ[0])) {
     g_armSeqOn = false;
-    Serial.println(F("ARM seq abort — attach refused"));
+    Serial.println(F("ARM ALL abort — attach refused"));
   }
 }
 
 static void serviceArmSeq() {
   if (!g_armSeqOn) return;
-  if (g_runMotion || g_flapOn) {
+  if (g_runMotion || g_flapOn || g_stopping) {
     g_armSeqOn = false;
+    g_armSeqGapUntil = 0;
     return;
   }
   uint8_t ch = ARM_SEQ[g_armSeqI];
-  if (chAttached(ch) || (g_jogMask & (1u << ch))) return;
+  if (chAttached(ch) || (g_jogMask & (1u << ch))) {
+    g_armSeqGapUntil = 0;
+    return;
+  }
+  if (g_armSeqGapUntil == 0) {
+    g_armSeqGapUntil = millis() + ARM_SEQ_GAP_MS;
+    return;
+  }
+  if (millis() < g_armSeqGapUntil) return;
+  g_armSeqGapUntil = 0;
   g_armSeqI++;
   if (g_armSeqI >= NUM_SERVOS) {
     g_armSeqOn = false;
     g_pose = POSE_CLOSED;
-    Serial.println(F("ARM seq done"));
+    g_poseKnown = true;
+    Serial.println(F("ARM ALL done"));
     return;
   }
-  if (!pulseArmCh(ARM_SEQ[g_armSeqI])) {
+  if (!armSeqPulse(ARM_SEQ[g_armSeqI])) {
     g_armSeqOn = false;
-    Serial.println(F("ARM seq abort — attach refused"));
+    Serial.println(F("ARM ALL abort — attach refused"));
+  }
+}
+
+// Master only. Completes ARM+ch the Slave missed (boot race, no 802.11 ACK
+// on broadcast). Does not change D: still STOP+close once this board is ready.
+// Only while we are idle at taught CLOSED — do not yank a COLD slave to
+// closed while this wing is open or folding. Finite: ARM_CATCHUP_MAX sends
+// then stop; a Slave reboot (mask drops to 0) opens a new window.
+static void serviceArmCatchUp() {
+  if (!roleIsMaster()) return;
+  if (!g_brakeReady || !g_poseKnown || g_pose != POSE_CLOSED) return;
+  if (g_armSeqOn || g_runMotion || g_flapOn || g_stopping) return;
+  if (!nowHasPeer() || nowSlaveLink() != NOW_LINK_LIVE) return;
+  if (!nowHavePeerState()) return;
+
+  static unsigned long g_catchUpAt = 0;
+  static uint8_t g_catchUpLeft = 0;
+  static bool g_catchUpGaveUp = false;
+  static uint8_t g_catchUpLastHave = 0xFF;
+
+  if (nowPeerBrakeReady()) {
+    g_catchUpLeft = 0;
+    g_catchUpGaveUp = false;
+    g_catchUpLastHave = nowPeerCycledMask();
+    return;
+  }
+
+  const uint8_t have = nowPeerCycledMask();
+  const uint8_t all = (uint8_t)((1u << NUM_SERVOS) - 1u);
+  if ((have & all) == all) return;
+
+  if (g_catchUpLastHave != 0xFF && g_catchUpLastHave != 0 && have == 0) {
+    g_catchUpGaveUp = false;
+    g_catchUpLeft = 0;
+    Serial.println(F("CATCH-UP: slave mask cleared — new window"));
+  }
+  g_catchUpLastHave = have;
+  if (g_catchUpGaveUp) return;
+
+  unsigned long now = millis();
+  if (g_catchUpAt != 0 && (now - g_catchUpAt) < ARM_CATCHUP_MS) return;
+  g_catchUpAt = now;
+
+  if (g_catchUpLeft == 0) g_catchUpLeft = ARM_CATCHUP_MAX;
+
+  for (uint8_t i = 0; i < NUM_SERVOS; i++) {
+    uint8_t ch = ARM_SEQ[i];
+    if (have & (1u << ch)) continue;
+    int16_t p = (int16_t)ch;
+    nowBroadcastCmd(CMD_ARM, &p, 1);
+    g_catchUpLeft--;
+    Serial.printf("CATCH-UP ARM %s (slave mask=0x%02X) left=%u\n",
+                  SERVO_NAMES[ch], (unsigned)have, (unsigned)g_catchUpLeft);
+    if (g_catchUpLeft == 0) {
+      g_catchUpGaveUp = true;
+      Serial.println(F("CATCH-UP give up — slave still COLD"));
+    }
+    return;
   }
 }
 
 void servosDisarm() {
   abortPath();
+  g_stopping = false;
+  g_homeAfterStop = false;
+  g_pendingRelease = 0;
   detachAll();
   // Derived, not asserted: if the driver refused a release the pad is still live
   // and claiming DISARMED would be a lie about a servo that is still driven.
@@ -1389,34 +1535,59 @@ void servosDisarm() {
                          : F("DISARMED"));
 }
 
-// STOP is not "hold PWM". Abort, keep where the servo actually is, detach so
-// the ANNIMOS brake holds. Do not change g_pose (may be mid-path).
+// STOP is not "hold PWM". Freeze at the emitted pulse, wait until the driver
+// has caught up, then release in a gap so the ANNIMOS brake holds. Nearest
+// taught pose is adopted so A/B/OPEN/CLOSE can continue from that pulse;
+// D also preempts the settle (button.cpp) if the operator wants slow close.
 void servosStop() {
-  abortPath();
-  for (uint8_t i = 0; i < NUM_SERVOS; i++) {
-    // Halt at the emitted position, not the commanded one: mid-move the ramp is
-    // ahead of the driver, and stopping at the commanded value would ask for one
-    // last move rather than stopping.
-    if (sdAttached(i)) g_actual[i] = sdWritten(i);
-    g_target[i] = g_actual[i];
-  }
-  detachAll();
+  abortAndReleaseExcept(0);
+  g_homeAfterStop = false;
+  g_stopping = (sdAttachMask() != 0);
   g_armed = (sdAttachMask() != 0);
-  Serial.println(g_armed ? F("STOP INCOMPLETE — a pad is still live")
-                         : F("STOP — last actual, detached (brake)"));
+  if (!g_stopping) {
+    adoptNearestPose();
+    Serial.println(F("STOP — already detached"));
+    return;
+  }
+  Serial.println(F("STOP — freeze, settle, then release"));
 }
 
 void servosDisarmCh(uint8_t ch) {
   if (ch >= NUM_SERVOS) return;
-  abortPath();
+  abortAndReleaseExcept((uint8_t)(1u << ch));
   detachOne(ch);
   Serial.printf("DISARMED ch%u %s\n", (unsigned)ch, SERVO_NAMES[ch]);
 }
 
 void servosHome(bool forceArm) {
   (void)forceArm;
-  startRunMotion(PATH_UNHUG_THEN_CLOSE, SPD_QUARTER, SPD_QUARTER, true);
-  Serial.println(F("D staged unhug then close"));
+
+  if (!g_brakeReady) {
+    // Fob-only bring-up. Second D aborts the sequence (STOP on both wings).
+    if (g_armSeqOn || g_stopping) {
+      Serial.println(F("D abort ARM ALL"));
+      servosStop();
+      if (roleIsMaster() && nowHasPeer()) nowBroadcastCmd(CMD_STOP);
+      return;
+    }
+    servosArm();
+    return;
+  }
+
+  // Live: STOP, then slow close. Do not call servosStop() here — that
+  // clears g_homeAfterStop (STOP button is freeze-only).
+  abortAndReleaseExcept(0);
+  g_homeAfterStop = true;
+  g_stopping = (sdAttachMask() != 0);
+  g_armed = (sdAttachMask() != 0);
+  if (!g_stopping) {
+    g_homeAfterStop = false;
+    adoptNearestPose();
+    startRunMotion(PATH_UNHUG_THEN_CLOSE, SPD_QUARTER, SPD_QUARTER, true);
+    Serial.println(F("D stop+close (already idle)"));
+    return;
+  }
+  Serial.println(F("D STOP then slow close"));
 }
 
 bool servosAllArrived() {
@@ -1428,12 +1599,19 @@ bool servosAllArrived() {
 
 static bool requireBrakeReady(const char* what) {
   if (g_brakeReady) return true;
-  Serial.printf("COLD — %s needs ARM/HOME first\n", what);
+  Serial.printf("COLD — %s needs ARM (fob D) first\n", what);
+  return false;
+}
+
+static bool requireRunReady(const char* what) {
+  if (!requireBrakeReady(what)) return false;
+  if (g_poseKnown) return true;
+  Serial.printf("%s needs HOME — pose unknown after STOP\n", what);
   return false;
 }
 
 void cmdToggleWing() {
-  if (!requireBrakeReady("A")) return;
+  if (!requireRunReady("A")) return;
   if (g_pose == POSE_CLOSED) {
     startRunMotion(PATH_OPEN, SPD_FULL, SPD_FULL, false);
     Serial.println(F("A OPEN WR+ER+SH together"));
@@ -1447,7 +1625,7 @@ void cmdToggleWing() {
 }
 
 void cmdHug() {
-  if (!requireBrakeReady("B")) return;
+  if (!requireRunReady("B")) return;
   if (g_pose == POSE_CLOSED) {
     startRunMotion(PATH_OPEN_THEN_HUG, SPD_FULL, SPD_HALF, false);
     Serial.println(F("B OPEN then HUG staged"));
@@ -1485,6 +1663,27 @@ static int destUsForPose(uint8_t ch, WingPose pose) {
   return homeUs(ch);
 }
 
+// After STOP the horns sit at g_actual. Pick the closest taught pose so
+// toggle A/B has a defined next move instead of "needs HOME".
+static void adoptNearestPose() {
+  const WingPose cands[3] = { POSE_CLOSED, POSE_OPEN, POSE_HUG };
+  int best = 0x7fffffff;
+  WingPose pick = POSE_CLOSED;
+  for (uint8_t p = 0; p < 3; p++) {
+    int err = 0;
+    for (uint8_t i = 0; i < NUM_SERVOS; i++)
+      err += abs(g_actual[i] - destUsForPose(i, cands[p]));
+    if (err < best) {
+      best = err;
+      pick = cands[p];
+    }
+  }
+  g_pose = pick;
+  g_poseKnown = true;
+  Serial.printf("STOP pose=%s (nearest)\n",
+                pick == POSE_OPEN ? "OPEN" : pick == POSE_HUG ? "HUG" : "CLOSED");
+}
+
 static bool actualAtPose(WingPose pose) {
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
     if (abs(g_actual[i] - destUsForPose(i, pose)) > ARRIVE_US) return false;
@@ -1504,9 +1703,10 @@ static bool raisesAtOpen() {
 }
 
 static void cmdPoseOpen() {
-  if (!requireBrakeReady("OPEN")) return;
+  if (!requireRunReady("OPEN")) return;
   if (actualAtPose(POSE_OPEN)) {
     g_pose = POSE_OPEN;
+    g_poseKnown = true;
     Serial.println(F("OPEN already there"));
     return;
   }
@@ -1520,9 +1720,10 @@ static void cmdPoseOpen() {
 }
 
 static void cmdPoseClosed() {
-  if (!requireBrakeReady("CLOSE")) return;
+  if (!requireRunReady("CLOSE")) return;
   if (actualAtPose(POSE_CLOSED)) {
     g_pose = POSE_CLOSED;
+    g_poseKnown = true;
     Serial.println(F("CLOSE already there"));
     return;
   }
@@ -1540,26 +1741,48 @@ static int flapDeltaUs() {
                (uint32_t)SERVO_SPEC_TRAVEL_DEG);
 }
 
-static int flapCenterUs(uint8_t ch) {
-  return clampToSoft(ch, g_cal[ch].center);
+// Pivot is taught CLOSED (parked / OPEN hugs), not cal.center.
+static int flapPivotUs(uint8_t ch) { return homeUs(ch); }
+
+// Room on both sides of closed so forward and back stay equal after clamp.
+static int flapRoomUs(uint8_t ch) {
+  const int c = flapPivotUs(ch);
+  const int below = c - softMinOf(ch);
+  const int above = softMaxOf(ch) - c;
+  const int room = (below < above) ? below : above;
+  return (room < 0) ? 0 : room;
 }
 
-// Hug pose is forward. If hug == center, treat +µs as forward.
-static int flapFwdSign(uint8_t ch) {
-  int c = flapCenterUs(ch);
-  return ((int)g_poseHug[ch] >= c) ? 1 : -1;
+static int flapElbowDeltaUs() {
+  int d = flapDeltaUs();
+  const int de = flapRoomUs(CH_ELBOW2);
+  if (de < d) d = de;
+  return d;
+}
+
+static int flapChDeltaUs(uint8_t ch) {
+  int d = flapElbowDeltaUs();
+  if (ch == CH_WRIST2) d *= SEQ_FLAP_WRIST_MULT;
+  const int room = flapRoomUs(ch);
+  if (room < d) d = room;
+  return d;
+}
+
+// Elbow first stroke toward its hug (forward). Wrist first stroke away from
+// its hug so the pair counters. Step 1 flips both, equal µs past closed.
+static int flapStrokeSign(uint8_t ch, uint8_t step) {
+  const int span = spanFromClosed(ch, g_poseHug[ch]);
+  int s = (span < 0) ? -1 : 1;
+  if (ch == CH_WRIST2) s = -s;
+  return (step == 0) ? s : -s;
 }
 
 static int flapDestUs(uint8_t ch, uint8_t step) {
-  int c = flapCenterUs(ch);
-  int d = flapDeltaUs();
-  int s = flapFwdSign(ch);
-  if (step == 0) return clampToSoft(ch, c + s * d);
-  return clampToSoft(ch, c - s * d);
+  return clampToSoft(ch, flapPivotUs(ch) + flapStrokeSign(ch, step) * flapChDeltaUs(ch));
 }
 
 static int flapStepDest(uint8_t ch) {
-  if (g_flapPreamble || g_flapHome) return flapCenterUs(ch);
+  if (g_flapPreamble || g_flapHome) return flapPivotUs(ch);
   return flapDestUs(ch, g_flapStep);
 }
 
@@ -1603,24 +1826,30 @@ static void finishFlap() {
   detachOne(CH_WRIST2);
   g_armed = (sdAttachMask() != 0);
   g_pose = POSE_OPEN;
-  Serial.println(F("FLAP done — hugs at center, brake"));
+  Serial.println(F("FLAP done — hugs at closed, brake"));
 }
 
 static void beginFlap() {
-  abortPath();
+  abortAndReleaseExcept((uint8_t)((1u << CH_ELBOW2) | (1u << CH_WRIST2)));
   g_flapOn = true;
   g_flapPending = false;
-  g_flapPreamble = true;
+  g_flapPreamble = false;
   g_flapHome = false;
   g_flapCycle = 0;
   g_flapStep = 0;
   g_speed = SPD_HALF;
   g_pose = POSE_OPEN;
   g_armed = true;
-  Serial.printf("FLAP ±%ddeg (%d us) thru-center %u strokes wrist lag %u ms\n",
-                SEQ_FLAP_DEG, flapDeltaUs(),
+  Serial.printf("FLAP ±%ddeg elbow %d us, wrist %dx %d us, "
+                "elbow toward hug, wrist opposite, %u cycles, lag %u ms\n",
+                SEQ_FLAP_DEG, flapChDeltaUs(CH_ELBOW2),
+                SEQ_FLAP_WRIST_MULT, flapChDeltaUs(CH_WRIST2),
                 (unsigned)SEQ_FLAP_CYCLES,
                 (unsigned)SEQ_FLAP_WRIST_LAG_MS);
+  Serial.printf("FLAP dest EH %d/%d WH %d/%d (closed %d/%d)\n",
+                flapDestUs(CH_ELBOW2, 0), flapDestUs(CH_ELBOW2, 1),
+                flapDestUs(CH_WRIST2, 0), flapDestUs(CH_WRIST2, 1),
+                flapPivotUs(CH_ELBOW2), flapPivotUs(CH_WRIST2));
   if (!kickFlapStep()) abortFlap();
 }
 
@@ -1678,7 +1907,7 @@ static void serviceFlap() {
 }
 
 void startSequence() {
-  if (!requireBrakeReady("FLAP")) return;
+  if (!requireRunReady("FLAP")) return;
   if (g_pose == POSE_OPEN && raisesAtOpen()) {
     beginFlap();
     return;
@@ -1694,9 +1923,10 @@ void startSequence() {
 }
 
 static void cmdPoseHug() {
-  if (!requireBrakeReady("HUG")) return;
+  if (!requireRunReady("HUG")) return;
   if (actualAtPose(POSE_HUG)) {
     g_pose = POSE_HUG;
+    g_poseKnown = true;
     Serial.println(F("HUG already there"));
     return;
   }
@@ -1734,11 +1964,12 @@ static void serviceJogEase() {
 }
 
 static void serviceSetupIdle() {
-  if (g_runMotion || g_flapOn) return;
+  if (g_runMotion || g_flapOn || g_stopping) return;
   unsigned long now = millis();
   for (uint8_t ch = 0; ch < NUM_SERVOS; ch++) {
     if (!chAttached(ch)) continue;
     if (g_jogMask & (1u << ch)) continue;
+    if (g_pendingRelease & (1u << ch)) continue;
     if (chNeedsMove(ch)) continue;
     if (g_setupIdleAt[ch] == 0) {
       g_setupIdleAt[ch] = now + SETUP_IDLE_DETACH_MS;
@@ -1763,9 +1994,39 @@ static void serviceLastCmdSave() {
   // but the move is not over — that mid-path window is what used to put an NVS
   // write inside the motion path.
   if (sdAttachMask() != 0) return;
-  if (g_runMotion || g_flapOn || g_armSeqOn) return;
+  if (g_runMotion || g_flapOn || g_armSeqOn || g_stopping) return;
   g_lastCmdDirty = false;
   storeSaveLastCmd();
+}
+
+static void servicePendingRelease() {
+  if (g_pendingRelease != 0) {
+    for (uint8_t i = 0; i < NUM_SERVOS; i++) {
+      if (!(g_pendingRelease & (1u << i))) continue;
+      if (!sdAttached(i)) {
+        g_pendingRelease &= (uint8_t)~(1u << i);
+        continue;
+      }
+      if (!sdSettled(i)) continue;
+      detachOne(i);
+      if (!sdAttached(i)) g_pendingRelease &= (uint8_t)~(1u << i);
+    }
+  }
+  if (g_stopping && g_pendingRelease == 0) {
+    g_stopping = false;
+    g_armed = (sdAttachMask() != 0);
+    adoptNearestPose();
+    Serial.println(g_armed ? F("STOP INCOMPLETE — a pad is still live")
+                           : F("STOP — last actual, detached (brake)"));
+    if (g_homeAfterStop && sdAttachMask() == 0) {
+      g_homeAfterStop = false;
+      startRunMotion(PATH_UNHUG_THEN_CLOSE, SPD_QUARTER, SPD_QUARTER, true);
+      Serial.println(F("D staged unhug then close"));
+    } else if (g_homeAfterStop) {
+      Serial.println(F("D dropped — STOP left a pad live"));
+      g_homeAfterStop = false;
+    }
+  }
 }
 
 void servosService() {
@@ -1791,6 +2052,7 @@ void servosService() {
   lastServiceMs = nowMs;
   g_attachSinceService = 0;
 
+  servicePendingRelease();
   serviceGroup();
   serviceCosineRamp();
   servicePath();
@@ -1798,6 +2060,7 @@ void servosService() {
   serviceFlap();
   serviceSetupIdle();
   serviceArmSeq();
+  serviceArmCatchUp();
   serviceLastCmdSave();
 }
 
@@ -1808,8 +2071,11 @@ void servosHandleCmd(CmdId cmd, const int16_t* payload, uint8_t payloadLen) {
         Serial.printf("CMD ARM ch=%u\n", (unsigned)payload[0]);
         servosArmCh((uint8_t)payload[0]);
       } else {
-        Serial.println(F("CMD ARM ignore — need ch 0-4 (serial `arm` is bench seq)"));
+        Serial.println(F("CMD ARM ignore — need ch 0-4 (use ARM ALL for the seq)"));
       }
+      break;
+    case CMD_ARM_ALL:
+      servosArm();
       break;
     case CMD_DISARM:
       if (payload && payloadLen >= 1 && payload[0] >= 0 && payload[0] < NUM_SERVOS)

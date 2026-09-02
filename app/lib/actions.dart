@@ -16,5 +16,7 @@ class WingsActions {
 
   Future<void> arm(int ch) => _send(CmdId.arm, [ch & 0xff]);
 
+  Future<void> armAll() => _send(CmdId.armAll);
+
   Future<void> disarm(int ch) => _send(CmdId.disarm, [ch & 0xff]);
 }

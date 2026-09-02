@@ -11,15 +11,20 @@ const _prompts = [
   'Valkyrie',
   'Valkyrie',
   'Valkyrie',
-  'Valkyrie',
-  'Valkyrie',
-  'Valkyrie',
-  'Valkyrie',
+  'open',
+  'open',
   'open',
   'close',
+  'close',
+  'close',
+  'hug',
   'hug',
   'home',
+  'home',
   'stop',
+  'stop',
+  'flap',
+  'flap',
 ];
 
 class VoicePage extends StatefulWidget {
@@ -35,6 +40,7 @@ class _VoicePageState extends State<VoicePage> {
   final _name = TextEditingController();
   final _voice = WingsSession.instance.voice;
   bool _holding = false;
+  bool _busy = false;
   bool _enrolling = false;
   int _enrollI = 0;
   final _clips = <Float32List>[];
@@ -59,50 +65,70 @@ class _VoicePageState extends State<VoicePage> {
   }
 
   Future<void> _down() async {
+    if (_holding || _busy) return;
     await Permission.microphone.request();
     setState(() {
       _holding = true;
       _msg = _enrolling ? 'Recording ${_prompts[_enrollI]}…' : 'Listening…';
     });
-    await _voice.startPtt();
+    await _voice.startPtt(cue: !_enrolling);
   }
 
   Future<void> _up() async {
-    setState(() => _holding = false);
-    if (_enrolling) {
-      await _voice.stopPtt(commit: false);
-      final emb = await _voice.enrollClip();
-      if (emb != null) _clips.add(emb);
-      _enrollI++;
-      if (_enrollI >= _prompts.length) {
-        final n = _name.text.trim();
-        if (n.isNotEmpty && _clips.length >= 10) {
-          await _voice.addProfile(n, List<Float32List>.from(_clips));
-          _msg = 'Saved profile $n';
-        } else {
-          _msg = 'Need a name and 10+ clips. Got ${_clips.length}.';
+    if (!_holding || _busy) return;
+    _holding = false;
+    _busy = true;
+    setState(() {});
+    try {
+      if (_enrolling) {
+        await _voice.stopPtt(commit: false);
+        final emb = await _voice.enrollClip();
+        if (emb == null) {
+          _msg =
+              'Too short — keep holding about a second. Still: ${_prompts[_enrollI]} '
+              '(${_enrollI + 1}/${_prompts.length}, ${_clips.length} saved)';
+          if (mounted) setState(() {});
+          return;
         }
-        _enrolling = false;
-        _enrollI = 0;
-        _clips.clear();
-      } else {
-        _msg = 'Got clip ${_clips.length}. Next: ${_prompts[_enrollI]}';
+        _clips.add(emb);
+        _enrollI++;
+        if (_enrollI >= _prompts.length) {
+          final n = _name.text.trim();
+          if (n.isEmpty) {
+            _msg = 'Name the profile first, then enroll again.';
+          } else {
+            final ok =
+                await _voice.addProfile(n, List<Float32List>.from(_clips));
+            _msg = ok
+                ? 'Saved profile $n (${_clips.length} clips)'
+                : 'Save failed (already 2 profiles, or storage error).';
+          }
+          _enrolling = false;
+          _enrollI = 0;
+          _clips.clear();
+          _voice.setCue(true);
+        } else {
+          _msg =
+              'Saved ${_clips.length}. Next: ${_prompts[_enrollI]} '
+              '(${_enrollI + 1}/${_prompts.length})';
+        }
+        if (mounted) setState(() {});
+        return;
       }
+      final hit = await _voice.stopPtt();
+      if (hit == null) return;
+      final live = _voice.store?.live == true &&
+          (_voice.enrolled || _voice.store?.debugBypass == true);
+      await widget.onHeard(hit, fire: live);
       if (mounted) setState(() {});
-      return;
+    } finally {
+      _busy = false;
     }
-    final hit = await _voice.stopPtt();
-    if (hit == null) return;
-    final live = _voice.store?.live == true &&
-        (_voice.enrolled || _voice.store?.debugBypass == true);
-    await widget.onHeard(hit, fire: live);
-    if (mounted) setState(() {});
   }
 
   @override
   Widget build(BuildContext context) {
     final st = _voice.store;
-    final hit = _voice.lastHit.value;
     final bottom = MediaQuery.paddingOf(context).bottom;
     return ListView(
       padding: EdgeInsets.fromLTRB(16, 16, 16, 24 + bottom),
@@ -116,46 +142,117 @@ class _VoicePageState extends State<VoicePage> {
           style: const TextStyle(color: Colors.white70),
         ),
         const SizedBox(height: 8),
-        if (hit != null)
-          Card(
-            color: hit.speakerOk && hit.keyword.isNotEmpty
-                ? Colors.green.shade900
-                : Colors.grey.shade900,
-            child: ListTile(
-              title: Text(
-                hit.keyword.isEmpty ? 'No command' : hit.keyword.toUpperCase(),
-                style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+        ValueListenableBuilder<String>(
+          valueListenable: _voice.micRoute,
+          builder: (context, route, _) {
+            if (route.isEmpty) return const SizedBox.shrink();
+            final phone = route.toLowerCase() == 'phone';
+            return Text(
+              phone
+                  ? 'MIC: PHONE (earpiece not captured — reconnect the bud, then Retrain)'
+                  : 'MIC: $route',
+              style: TextStyle(
+                color: phone ? Colors.orangeAccent : Colors.lightGreenAccent,
+                fontWeight: FontWeight.bold,
               ),
-              subtitle: Text(
-                'speaker ${hit.speaker.isEmpty ? "-" : hit.speaker}  '
-                'score ${hit.score.toStringAsFixed(2)}  '
-                '${hit.speakerOk ? "MATCH" : "NO MATCH"}',
-              ),
-            ),
+            );
+          },
+        ),
+        const SizedBox(height: 8),
+        ValueListenableBuilder<VoiceHit?>(
+            valueListenable: _voice.lastHit,
+            builder: (context, hit, _) {
+              if (hit == null) return const SizedBox.shrink();
+              final isWake = hit.keyword == 'valkyrie';
+              final hasCmd = hit.keyword.isNotEmpty && !isWake;
+              final title = hit.keyword.isEmpty
+                  ? 'No command'
+                  : isWake
+                      ? 'VALKYRIE — say a command'
+                      : hit.keyword.toUpperCase();
+              return Card(
+                color: (hit.speakerOk && hasCmd)
+                    ? Colors.green.shade900
+                    : (isWake && hit.speakerOk)
+                        ? Colors.cyan.shade900
+                        : Colors.grey.shade900,
+                child: ListTile(
+                  title: Text(
+                    title,
+                    style: const TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  subtitle: ValueListenableBuilder<String>(
+                    valueListenable: _voice.lastKw,
+                    builder: (context, kw, _) {
+                      return Text(
+                        'speaker ${hit.speaker.isEmpty ? "-" : hit.speaker}  '
+                        'score ${hit.score.toStringAsFixed(2)} / ${(st?.threshold ?? 0.35).toStringAsFixed(2)}  '
+                        '${hit.score < 0 ? "NO PROFILE" : hit.speakerOk ? "SPEAKER OK" : "SPEAKER NO"}'
+                        '${kw.isEmpty ? "" : "  kws $kw"}',
+                      );
+                    },
+                  ),
+                ),
+              );
+            },
           ),
         const SizedBox(height: 8),
         Text(_msg, style: const TextStyle(color: Colors.white70)),
         const SizedBox(height: 12),
-        Listener(
-          onPointerDown: (_) => _down(),
-          onPointerUp: (_) => _up(),
-          onPointerCancel: (_) => _up(),
-          child: Container(
+        if (_voice.isAlways && !_enrolling)
+          Container(
             height: 72,
             alignment: Alignment.center,
             decoration: BoxDecoration(
-              color: _holding ? Colors.red : Colors.cyan.shade800,
+              color: Colors.green.shade900,
               borderRadius: BorderRadius.circular(12),
             ),
-            child: Text(
-              _holding ? 'RELEASE' : 'HOLD TO TALK',
-              style: const TextStyle(
-                fontSize: 20,
+            child: const Text(
+              'HANDS-FREE — say Valkyrie, then open/close/…',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 18,
                 fontWeight: FontWeight.bold,
                 color: Colors.white,
               ),
             ),
+          )
+        else
+          Listener(
+            onPointerDown: (_) => _down(),
+            onPointerUp: (_) => _up(),
+            onPointerCancel: (_) => _up(),
+            child: Container(
+              height: 72,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: _holding ? Colors.red : Colors.cyan.shade800,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Text(
+                _holding
+                    ? 'RELEASE'
+                    : (_enrolling ? 'HOLD TO RECORD' : 'HOLD TO TALK'),
+                style: const TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
+              ),
+            ),
           ),
+        const SizedBox(height: 8),
+        TextButton(
+          onPressed: () async {
+            await _voice.testChimes();
+            if (mounted) {
+              setState(() => _msg = 'Played wake / ok / no. Hear them in the earpiece?');
+            }
+          },
+          child: const Text('Test earpiece chimes'),
         ),
         const SizedBox(height: 16),
         SwitchListTile(
@@ -189,9 +286,9 @@ class _VoicePageState extends State<VoicePage> {
         SwitchListTile(
           title: const Text('Always listen (earpiece)'),
           subtitle: const Text(
-            'Background listen for Valkyrie from an enrolled voice, '
-            'then a 2.5s window for open/close/hug/home/stop/flap. '
-            'PTT stays for enroll and test.',
+            'Hands-free: Valkyrie (your voice) then a short command. '
+            'Mic mutes while the wings move (fob / e-stop still abort). '
+            'Earpiece chimes wake / ok / no. Hold-to-talk is only for enroll.',
           ),
           value: st?.alwaysListen ?? false,
           onChanged: (st == null || !st.live) ? null : (v) async {
@@ -223,6 +320,12 @@ class _VoicePageState extends State<VoicePage> {
         ),
         const Divider(),
         const Text('Profiles (1–2)', style: TextStyle(fontWeight: FontWeight.bold)),
+        const SizedBox(height: 4),
+        const Text(
+          'Retrain with the earpiece in and the phone away from your mouth. '
+          'The MIC line above must show the headset, not PHONE.',
+          style: TextStyle(color: Colors.white70, fontSize: 13),
+        ),
         for (final p in st?.profiles ?? [])
           ListTile(
             title: Text(p.name),
@@ -231,15 +334,16 @@ class _VoicePageState extends State<VoicePage> {
               mainAxisSize: MainAxisSize.min,
               children: [
                 TextButton(
-                  onPressed: () async {
+                  onPressed: () {
                     _name.text = p.name;
-                    await _voice.deleteProfile(p.name);
                     setState(() {
                       _enrolling = true;
                       _enrollI = 0;
                       _clips.clear();
-                      _msg = 'Retrain ${p.name}. Hold PTT: ${_prompts[0]}';
+                      _msg =
+                          'Retrain ${p.name} (old clips stay until save). Hold PTT: ${_prompts[0]}';
                     });
+                    _voice.setCue(false);
                   },
                   child: const Text('Retrain'),
                 ),
@@ -274,8 +378,9 @@ class _VoicePageState extends State<VoicePage> {
                   _clips.clear();
                   _msg = 'Hold PTT and say: ${_prompts[0]}';
                 });
+                _voice.setCue(false);
               },
-              child: const Text('Enroll 13 clips (8× Valkyrie)'),
+              child: const Text('Enroll 18 clips (4× Valkyrie, extra open/close)'),
             ),
         ],
       ],
