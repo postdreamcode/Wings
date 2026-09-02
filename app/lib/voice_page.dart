@@ -7,23 +7,23 @@ import 'voice_engine.dart';
 import 'wings_session.dart';
 
 const _prompts = [
+  'Hey Valkyrie',
+  'Hey Valkyrie',
   'Valkyrie',
   'Valkyrie',
   'Valkyrie',
   'Valkyrie',
+  'Valkyrie open',
+  'Valkyrie open',
+  'Valkyrie close',
+  'Valkyrie close',
   'open',
   'open',
-  'open',
-  'close',
   'close',
   'close',
   'hug',
-  'hug',
-  'home',
   'home',
   'stop',
-  'stop',
-  'flap',
   'flap',
 ];
 
@@ -64,8 +64,27 @@ class _VoicePageState extends State<VoicePage> {
     if (mounted) setState(() {});
   }
 
+  Future<bool> _headsetOrRefuse() async {
+    final r = await _voice.waitMicRoute();
+    final phone = r.trim().toLowerCase() == 'phone';
+    await _voice.dropMicIfIdle();
+    if (phone) {
+      if (mounted) {
+        setState(() => _msg =
+            'MIC: PHONE (earpiece not captured — reconnect the bud, then Retrain)');
+      }
+      return false;
+    }
+    return true;
+  }
+
   Future<void> _down() async {
     if (_holding || _busy) return;
+    if (_enrolling && _voice.isPhoneMic) {
+      setState(() => _msg =
+          'MIC: PHONE (earpiece not captured — reconnect the bud, then Retrain)');
+      return;
+    }
     await Permission.microphone.request();
     setState(() {
       _holding = true;
@@ -82,6 +101,13 @@ class _VoicePageState extends State<VoicePage> {
     try {
       if (_enrolling) {
         await _voice.stopPtt(commit: false);
+        await _voice.peekMicRoute();
+        if (_voice.isPhoneMic) {
+          _msg =
+              'MIC: PHONE (earpiece not captured — reconnect the bud, then Retrain)';
+          if (mounted) setState(() {});
+          return;
+        }
         final emb = await _voice.enrollClip();
         if (emb == null) {
           _msg =
@@ -137,7 +163,7 @@ class _VoicePageState extends State<VoicePage> {
           _voice.ready
               ? (_voice.isAlways
                   ? 'Always listen  ·  Valkyrie (your voice) then command'
-                  : 'PTT test  ·  Valkyrie then open/close/hug/home/stop/flap')
+                  : 'PTT test  ·  Valkyrie open, or Valkyrie then open/close')
               : (_voice.error.isEmpty ? 'Loading models…' : _voice.error),
           style: const TextStyle(color: Colors.white70),
         ),
@@ -211,7 +237,7 @@ class _VoicePageState extends State<VoicePage> {
               borderRadius: BorderRadius.circular(12),
             ),
             child: const Text(
-              'HANDS-FREE — say Valkyrie, then open/close/…',
+              'HANDS-FREE — Valkyrie open, or Valkyrie then open',
               textAlign: TextAlign.center,
               style: TextStyle(
                 fontSize: 18,
@@ -265,6 +291,7 @@ class _VoicePageState extends State<VoicePage> {
           onChanged: (st == null || (!_voice.enrolled && !(st.debugBypass)))
               ? null
               : (v) async {
+                  if (v && !await _headsetOrRefuse()) return;
                   st.live = v;
                   await st.save();
                   if (v) {
@@ -274,7 +301,9 @@ class _VoicePageState extends State<VoicePage> {
                           : 'Wings listening (PTT)',
                       mic: true,
                     );
-                    if (st.alwaysListen) await _voice.startAlways();
+                    if (st.alwaysListen) {
+                      await _voice.startAlways();
+                    }
                   } else {
                     await _voice.stopAlways();
                     await WingsSession.instance.native
@@ -286,25 +315,29 @@ class _VoicePageState extends State<VoicePage> {
         SwitchListTile(
           title: const Text('Always listen (earpiece)'),
           subtitle: const Text(
-            'Hands-free: Valkyrie (your voice) then a short command. '
+            'Say Valkyrie open in one breath, or Valkyrie then open. '
+            'Short open/close only after the wake chime. '
             'Mic mutes while the wings move (fob / e-stop still abort). '
             'Earpiece chimes wake / ok / no. Hold-to-talk is only for enroll.',
           ),
           value: st?.alwaysListen ?? false,
-          onChanged: (st == null || !st.live) ? null : (v) async {
-            st.alwaysListen = v;
-            await st.save();
-            if (v) {
-              await _voice.startAlways();
-              await WingsSession.instance.native
-                  .startFg('Wings listening', mic: true);
-            } else {
-              await _voice.stopAlways();
-              await WingsSession.instance.native
-                  .startFg('Wings listening (PTT)', mic: true);
-            }
-            setState(() {});
-          },
+          onChanged: (st == null || !st.live)
+              ? null
+              : (v) async {
+                  if (v && !await _headsetOrRefuse()) return;
+                  st.alwaysListen = v;
+                  await st.save();
+                  if (v) {
+                    await _voice.startAlways();
+                    await WingsSession.instance.native
+                        .startFg('Wings listening', mic: true);
+                  } else {
+                    await _voice.stopAlways();
+                    await WingsSession.instance.native
+                        .startFg('Wings listening (PTT)', mic: true);
+                  }
+                  setState(() {});
+                },
         ),
         SwitchListTile(
           title: const Text('Debug: skip speaker lock'),
@@ -334,7 +367,8 @@ class _VoicePageState extends State<VoicePage> {
               mainAxisSize: MainAxisSize.min,
               children: [
                 TextButton(
-                  onPressed: () {
+                  onPressed: () async {
+                    if (!await _headsetOrRefuse()) return;
                     _name.text = p.name;
                     setState(() {
                       _enrolling = true;
@@ -367,11 +401,12 @@ class _VoicePageState extends State<VoicePage> {
             Text('Say: ${_prompts[_enrollI]}  (${_enrollI + 1}/${_prompts.length})')
           else
             FilledButton.tonal(
-              onPressed: () {
+              onPressed: () async {
                 if (_name.text.trim().isEmpty) {
                   setState(() => _msg = 'Name the profile first.');
                   return;
                 }
+                if (!await _headsetOrRefuse()) return;
                 setState(() {
                   _enrolling = true;
                   _enrollI = 0;
@@ -380,7 +415,7 @@ class _VoicePageState extends State<VoicePage> {
                 });
                 _voice.setCue(false);
               },
-              child: const Text('Enroll 18 clips (4× Valkyrie, extra open/close)'),
+              child: const Text('Enroll 18 clips (Hey Valkyrie + Valkyrie open)'),
             ),
         ],
       ],

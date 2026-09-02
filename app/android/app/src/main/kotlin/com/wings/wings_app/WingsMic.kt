@@ -11,7 +11,7 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Handler
-import android.os.Looper
+import android.os.HandlerThread
 import io.flutter.plugin.common.EventChannel
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -35,11 +35,17 @@ class WingsMic(private val ctx: Context) : EventChannel.StreamHandler {
     private var thread: Thread? = null
     private var sink: EventChannel.EventSink? = null
     private var scoReceiver: BroadcastReceiver? = null
-    private val main = Handler(Looper.getMainLooper())
+    private var pcmThread: HandlerThread? = null
+    private var pcmHandler: Handler? = null
 
     override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
         sink = events
         val app = ctx.applicationContext
+        val ht = HandlerThread("wings-mic-pcm")
+        ht.start()
+        pcmThread = ht
+        val pcmH = Handler(ht.looper)
+        pcmHandler = pcmH
         thread = Thread {
             val am = app.getSystemService(Context.AUDIO_SERVICE) as AudioManager
             startSco(app, am)
@@ -51,13 +57,31 @@ class WingsMic(private val ctx: Context) : EventChannel.StreamHandler {
             )
             val frameBytes = sr / 50 * 2
             val recBuf = min.coerceAtLeast(frameBytes * 8)
-            val r = AudioRecord(
+            val sources = intArrayOf(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
                 MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                sr,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                recBuf,
+                MediaRecorder.AudioSource.UNPROCESSED,
+                MediaRecorder.AudioSource.MIC,
             )
+            var r: AudioRecord? = null
+            for (src in sources) {
+                try {
+                    val cand = AudioRecord(
+                        src,
+                        sr,
+                        AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                        recBuf,
+                    )
+                    if (cand.state == AudioRecord.STATE_INITIALIZED) {
+                        r = cand
+                        break
+                    }
+                    cand.release()
+                } catch (_: Exception) {
+                }
+            }
+            if (r == null) return@Thread
             rec = r
             bindHeadsetInput(am, r)
             try {
@@ -79,7 +103,7 @@ class WingsMic(private val ctx: Context) : EventChannel.StreamHandler {
                 }
                 if (n > 0) {
                     val copy = chunk.copyOf(n)
-                    main.post { sink?.success(copy) }
+                    pcmH.post { sink?.success(copy) }
                 }
             }
         }.also { it.start() }
@@ -88,6 +112,10 @@ class WingsMic(private val ctx: Context) : EventChannel.StreamHandler {
     override fun onCancel(arguments: Any?) {
         thread?.interrupt()
         thread = null
+        pcmHandler?.removeCallbacksAndMessages(null)
+        pcmThread?.quitSafely()
+        pcmHandler = null
+        pcmThread = null
         try {
             rec?.stop()
         } catch (_: Exception) {

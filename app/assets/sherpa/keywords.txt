@@ -1,7 +1,17 @@
-▁VA L K Y RI E :2.2 #0.14 @wake
-▁O P EN :2.0 #0.16 @c_open
-▁C LO SE :2.0 #0.18 @c_close
-▁HU G :2.0 #0.16 @c_hug
-▁HOME :2.0 #0.16 @c_home
-▁ST O P :2.0 #0.16 @c_stop
-▁F L A P :2.0 #0.16 @c_flap
+▁HE Y ▁VA L K Y RI E :2.5 #0.08 @wake
+▁VA L K Y RI E :2.5 #0.10 @wake
+▁VA L KE RI E :2.4 #0.12 @wake
+▁VA L K I RI E :2.4 #0.12 @wake
+▁VA L ▁K Y RI E :2.4 #0.12 @wake
+▁VA L K Y RI E ▁O P EN :2.4 #0.08 @v_open
+▁VA L K Y RI E ▁C LO SE :2.4 #0.08 @v_close
+▁VA L K Y RI E ▁HU G :2.4 #0.08 @v_hug
+▁VA L K Y RI E ▁HOME :2.4 #0.08 @v_home
+▁VA L K Y RI E ▁ST O P :2.4 #0.08 @v_stop
+▁VA L K Y RI E ▁F L A P :2.4 #0.08 @v_flap
+▁O P EN :2.2 #0.10 @c_open
+▁C LO SE :2.2 #0.12 @c_close
+▁HU G :2.2 #0.10 @c_hug
+▁HOME :2.2 #0.10 @c_home
+▁ST O P :2.2 #0.10 @c_stop
+▁F L A P :2.2 #0.10 @c_flap

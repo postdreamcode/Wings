@@ -42,6 +42,7 @@ class WingsVoice {
   so.OnlineStream? _cmdStream;
   final _pcm = <double>[];
   String _heard = '';
+  bool _oneshot = false;
   bool _wake = false;
   bool _always = false;
   bool _ptt = false;
@@ -52,6 +53,13 @@ class WingsVoice {
   String _kwWake = '';
   String _kwCmd = '';
   static const _cmdWindow = Duration(milliseconds: 4000);
+  static const _chimeDuck = Duration(milliseconds: 400);
+  static const _vadFrame = 320; // 20 ms @ 16 kHz
+  static const _minWakeSpeech = 9600; // 0.6 s
+  static const _maxWakeSpeech = 16000; // 1.0 s
+  static const _minEnrollSpeech = 11200; // 0.7 s
+  DateTime? _kwsDuckUntil;
+  Float32List? _spkClip;
   final lastKw = ValueNotifier<String>('');
   final micRoute = ValueNotifier<String>('');
   static const _ringN = 32000; // 2s @ 16 kHz
@@ -102,9 +110,10 @@ class WingsVoice {
             provider: 'cpu',
           ),
           keywordsFile: paths['keywords.txt']!,
-          keywordsScore: 1.5,
-          keywordsThreshold: 0.15,
+          keywordsScore: 2.5,
+          keywordsThreshold: 0.10,
           numTrailingBlanks: 1,
+          maxActivePaths: 8,
         ),
       );
       final kwLines = await File(paths['keywords.txt']!).readAsLines();
@@ -114,7 +123,7 @@ class WingsVoice {
           .join('\n');
       _kwCmd = kwLines
           .map((l) => l.trim())
-          .where((l) => l.contains('@c_'))
+          .where((l) => l.contains('@c_') || l.contains('@v_'))
           .join('\n');
       _ex = so.SpeakerEmbeddingExtractor(
         config: so.SpeakerEmbeddingExtractorConfig(
@@ -176,7 +185,6 @@ class WingsVoice {
     _cmdUntil = null;
     _disarmCmdWatch();
     if (!_ptt) await _stopMic(commit: false);
-    micRoute.value = '';
   }
 
   /// Mute KWS while servos run. Keep the headset mic/SCO up. No-op if not always-listen.
@@ -208,9 +216,31 @@ class WingsVoice {
     await _ensureMic();
   }
 
+  bool get isPhoneMic => micRoute.value.trim().toLowerCase() == 'phone';
+
+  Future<String> waitMicRoute() async {
+    await _ensureMic();
+    await Future<void>.delayed(const Duration(milliseconds: 900));
+    return peekMicRoute();
+  }
+
+  Future<String> peekMicRoute() async {
+    try {
+      micRoute.value = await _native.micRoute();
+    } catch (_) {}
+    return micRoute.value;
+  }
+
+  /// Stop capture if we only started it to read MIC route.
+  Future<void> dropMicIfIdle() async {
+    if (_always || _ptt) return;
+    await _stopMic(commit: false);
+  }
+
   void _ping(String kind) {
     // Mute only while an enroll hold is in progress, not a leftover flag.
     if (_ptt && !_cue) return;
+    _kwsDuckUntil = DateTime.now().add(_chimeDuck);
     unawaited(_chimeSafe(kind));
   }
 
@@ -273,8 +303,11 @@ class WingsVoice {
     _cmdUntil = null;
     _spkPending = false;
     _heard = '';
+    _oneshot = false;
+    _spkClip = null;
   }
 
+  /// Open both beams once per mic session. Never rebuild on wake.
   void _openStreams() {
     final spot = _spotter;
     if (spot == null) return;
@@ -351,6 +384,9 @@ class WingsVoice {
 
   void _onPcm(dynamic raw) {
     if (_listenPaused && !_ptt) return;
+    if (_kwsDuckUntil != null && DateTime.now().isBefore(_kwsDuckUntil!)) {
+      return;
+    }
     final bytes = raw is Uint8List ? raw : Uint8List.fromList(List<int>.from(raw as List));
     final n = bytes.length ~/ 2;
     final f = Float32List(n);
@@ -365,22 +401,30 @@ class WingsVoice {
     final wake = _wakeStream;
     final cmd = _cmdStream;
     if (wake != null) _feed(spot, wake, f, wakeSide: true);
-    final wantCmd = !_always || _ptt || _wake || _cmdOpen;
-    if (cmd != null && wantCmd) _feed(spot, cmd, f, wakeSide: false);
+    if (cmd != null) _feed(spot, cmd, f, wakeSide: false);
     if (_always && !_ptt && _heard.isNotEmpty) {
       if (_spkPending) return;
+      if (_oneshot) {
+        _spkPending = true;
+        unawaited(_verifyOneshot());
+        return;
+      }
       if (_wake || _cmdOpen) {
         _emitAlways();
       } else {
-        lastHit.value = VoiceHit(
-          keyword: _heard,
-          speaker: lastHit.value?.speaker ?? '',
-          score: lastHit.value?.score ?? 0,
-          speakerOk: false,
-        );
         _heard = '';
       }
     }
+  }
+
+  void _noteKw(String kw) {
+    final prev = lastKw.value;
+    if (prev.isEmpty) {
+      lastKw.value = kw;
+      return;
+    }
+    final last = prev.split(' → ').last;
+    lastKw.value = last == kw ? kw : '$last → $kw';
   }
 
   void _feed(
@@ -394,19 +438,32 @@ class WingsVoice {
       spot.decode(stream);
       final kw = spot.getResult(stream).keyword;
       if (kw.isEmpty) continue;
-      lastKw.value = kw;
       if (wakeSide) {
         if (_isWakeKw(kw)) {
+          _noteKw(kw);
           _acceptWake();
-          spot.reset(stream);
         }
+        spot.reset(stream);
       } else {
         var s = kw.trim().toLowerCase();
-        if (s.startsWith('c_')) s = s.substring(2);
-        if (_cmds.contains(s)) {
-          _heard = s;
-          spot.reset(stream);
+        var shot = false;
+        if (s.startsWith('v_')) {
+          s = s.substring(2);
+          shot = true;
+        } else if (s.startsWith('c_')) {
+          s = s.substring(2);
+          if (!_ptt && !_wake && !_cmdOpen) {
+            spot.reset(stream);
+            continue;
+          }
         }
+        if (_cmds.contains(s)) {
+          _noteKw(kw);
+          _heard = s;
+          _oneshot = shot;
+          if (shot) _spkClip = _wakeSpeechClip();
+        }
+        spot.reset(stream);
       }
     }
   }
@@ -425,23 +482,94 @@ class WingsVoice {
     return u != null && DateTime.now().isBefore(u);
   }
 
-  VoiceHit _scoreTail({String keyword = ''}) {
-    var pcm = _ringTail(19200).toList();
-    if (pcm.length < 8000) {
+  /// Last speech island in ~1.5s, first 0.6–1.0s (wake, not trailing "open").
+  Float32List _wakeSpeechClip() {
+    return _vadTrim(_ringTail(24000), fromStart: true);
+  }
+
+  int _energySamples(List<double> pcm) {
+    var n = 0;
+    for (var i = 0; i + _vadFrame <= pcm.length; i += _vadFrame) {
+      var e = 0.0;
+      for (var j = 0; j < _vadFrame; j++) {
+        final x = pcm[i + j];
+        e += x * x;
+      }
+      if (e >= _vadFrame * 4e-5) n += _vadFrame;
+    }
+    return n;
+  }
+
+  Float32List _vadTrim(Float32List pcm, {required bool fromStart}) {
+    if (pcm.isEmpty) return Float32List(0);
+    final n = pcm.length;
+    final frames = n ~/ _vadFrame;
+    if (frames < 1) return Float32List(0);
+    final energy = List<double>.filled(frames, 0.0);
+    var maxE = 0.0;
+    for (var f = 0; f < frames; f++) {
+      var e = 0.0;
+      final off = f * _vadFrame;
+      for (var j = 0; j < _vadFrame; j++) {
+        final x = pcm[off + j];
+        e += x * x;
+      }
+      energy[f] = e;
+      if (e > maxE) maxE = e;
+    }
+    final floor = _vadFrame * 4e-5;
+    if (maxE < floor) return Float32List(0);
+    final thr = max(maxE * 0.08, floor);
+    var end = -1;
+    for (var f = frames - 1; f >= 0; f--) {
+      if (energy[f] >= thr) {
+        end = f;
+        break;
+      }
+    }
+    if (end < 0) return Float32List(0);
+    var start = end;
+    while (start > 0 && energy[start - 1] >= thr) {
+      start--;
+    }
+    var a = start * _vadFrame;
+    var b = min(n, (end + 1) * _vadFrame);
+    if (b - a > _maxWakeSpeech) {
+      if (fromStart) {
+        b = a + _maxWakeSpeech;
+      } else {
+        a = b - _maxWakeSpeech;
+      }
+    }
+    final len = b - a;
+    final out = Float32List(len);
+    for (var i = 0; i < len; i++) {
+      out[i] = pcm[a + i];
+    }
+    return out;
+  }
+
+  VoiceHit _scoreClip(Float32List? clip, {String keyword = ''}) {
+    final bypass = store?.debugBypass == true;
+    final raw = clip ?? Float32List(0);
+    if (_energySamples(raw) < _minWakeSpeech) {
       return VoiceHit(
         keyword: keyword,
         speaker: '',
         score: 0,
-        speakerOk: store?.debugBypass == true,
+        speakerOk: bypass,
       );
     }
+    var pcm = raw.toList();
     if (pcm.length < 16000) {
       pcm.addAll(List<double>.filled(16000 - pcm.length, 0.0));
+    } else if (pcm.length > 16000) {
+      pcm = pcm.sublist(0, 16000);
     }
     final emb = _embed(pcm);
     var speaker = '';
     var score = 0.0;
-    var ok = store?.debugBypass == true;
+    var ok = bypass;
     if (emb != null && store != null) {
       final best = _bestSpeaker(emb);
       speaker = best.$1;
@@ -461,6 +589,7 @@ class WingsVoice {
     final already = _wake || _cmdOpen;
     _wake = true;
     _cmdUntil = DateTime.now().add(_cmdWindow);
+    if (!already) _spkClip = _wakeSpeechClip();
     if (!_always) {
       lastHit.value = VoiceHit(
         keyword: 'valkyrie',
@@ -473,13 +602,6 @@ class WingsVoice {
     }
     _armCmdWatch();
     if (already) return;
-    final c = _cmdStream;
-    final spot = _spotter;
-    if (c != null && spot != null) {
-      try {
-        spot.reset(c);
-      } catch (_) {}
-    }
     _spkPending = true;
     unawaited(_verifyWake());
   }
@@ -487,7 +609,7 @@ class WingsVoice {
   Future<void> _verifyWake() async {
     await Future<void>.delayed(Duration.zero);
     if (!_wake) return;
-    final gate = _scoreTail(keyword: 'valkyrie');
+    final gate = _scoreClip(_spkClip, keyword: 'valkyrie');
     if (!_wake) return;
     lastHit.value = gate;
     _spkPending = false;
@@ -497,8 +619,33 @@ class WingsVoice {
       _ping('no');
       return;
     }
+    if (_always && !_ptt && _heard.isNotEmpty) {
+      _emitAlways();
+      return;
+    }
     _ping('wake');
-    if (_always && !_ptt && _heard.isNotEmpty) _emitAlways();
+  }
+
+  Future<void> _verifyOneshot() async {
+    await Future<void>.delayed(Duration.zero);
+    final cmd = _heard;
+    _oneshot = false;
+    _spkPending = false;
+    if (cmd.isEmpty) return;
+    final gate = _scoreClip(_spkClip, keyword: cmd);
+    if (!gate.speakerOk) {
+      _heard = '';
+      lastHit.value = gate;
+      _ping('no');
+      return;
+    }
+    lastHit.value = VoiceHit(
+      keyword: cmd,
+      speaker: gate.speaker,
+      score: gate.score,
+      speakerOk: true,
+    );
+    _emitAlways();
   }
 
   void _acceptKw(String raw) {
@@ -507,14 +654,15 @@ class WingsVoice {
       _acceptWake();
       return;
     }
-    if (s.startsWith('c_')) s = s.substring(2);
+    if (s.startsWith('c_') || s.startsWith('v_')) s = s.substring(2);
     if (!_cmds.contains(s)) return;
     _heard = s;
   }
 
   static String? _cmdFromRaw(String raw) {
     var s = raw.trim().toLowerCase();
-    if (s.startsWith('c_')) s = s.substring(2);
+    if (s.contains(' → ')) s = s.split(' → ').last;
+    if (s.startsWith('c_') || s.startsWith('v_')) s = s.substring(2);
     return _cmds.contains(s) ? s : null;
   }
 
@@ -638,10 +786,13 @@ class WingsVoice {
     return d == 0 ? 0 : dot / d;
   }
 
-  /// Campplus wants ~1s. Short "open"/"stop" holds are padded; under 0.5s is rejected.
+  /// Campplus wants ~1s. Reject clips with under ~0.7s of real energy (zero-pad is not speech).
   Future<Float32List?> enrollClip() async {
     var pcm = List<double>.from(_pcm);
-    if (pcm.length < 8000) return null;
+    if (_energySamples(pcm) < _minEnrollSpeech) return null;
+    final trimmed = _vadTrim(Float32List.fromList(pcm), fromStart: true);
+    if (_energySamples(trimmed) < _minEnrollSpeech) return null;
+    pcm = trimmed.toList();
     if (pcm.length < 16000) {
       pcm.addAll(List<double>.filled(16000 - pcm.length, 0.0));
     }

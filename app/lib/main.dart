@@ -57,6 +57,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   StreamSubscription<WingsStatus>? _sub;
   StreamSubscription<bool>? _readySub;
   Timer? _listenResume;
+  final _moving = ValueNotifier<bool>(false);
   bool _ready = false;
   int _setupCh = 0;
   int _speedPct = 10;
@@ -100,6 +101,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   @override
   void dispose() {
     _listenResume?.cancel();
+    _moving.dispose();
     _sub?.cancel();
     _readySub?.cancel();
     _tabs.dispose();
@@ -114,6 +116,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         _ready = ok;
         if (!ok) {
           _status = null;
+          _moving.value = false;
           _posesFromBoard = false;
           _msg = _ble.holdingLink ? 'Reconnecting…' : 'Link dropped';
         } else {
@@ -122,7 +125,11 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       });
       if (ok) {
         await _syncFromBoard();
-        if (mounted) setState(() => _status = _ble.lastStatus);
+        if (mounted) {
+          _status = _ble.lastStatus;
+          _syncMoving(_status);
+          setState(() {});
+        }
       }
       if (_ble.holdingLink) {
         try {
@@ -132,27 +139,36 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     });
     _sub?.cancel();
     _sub = _ble.statusController.stream.listen((s) {
-      setState(() {
-        _status = s;
-        if (!macIsZero(s.peerMac)) _lastPeerMac = List<int>.from(s.peerMac);
-        if (!_speedDragging && s.speedPct >= 1 && s.speedPct <= 100) {
-          _speedPct = s.speedPct;
+      final wasMoving = (_status?.pathActive ?? false) || (_status?.seq ?? false);
+      _status = s;
+      if (!macIsZero(s.peerMac)) _lastPeerMac = List<int>.from(s.peerMac);
+      if (!_speedDragging && s.speedPct >= 1 && s.speedPct <= 100) {
+        _speedPct = s.speedPct;
+      }
+      if (!_chSpeedDragging && s.chSpeed.length == 5) {
+        for (var i = 0; i < 5; i++) {
+          final p = s.chSpeed[i];
+          if (p >= 1 && p <= 100) _chSpeed[i] = p;
         }
-        if (!_chSpeedDragging && s.chSpeed.length == 5) {
-          for (var i = 0; i < 5; i++) {
-            final p = s.chSpeed[i];
-            if (p >= 1 && p <= 100) _chSpeed[i] = p;
-          }
-        }
-      });
+      }
+      final moving = s.pathActive || s.seq;
+      if (moving != wasMoving) _moving.value = moving;
+      if (!WingsSession.instance.voice.isAlways && mounted) {
+        setState(() {});
+      }
       unawaited(_syncListenToMotion(s));
     });
     if (_ble.isReady) {
       _ready = true;
       _status = _ble.lastStatus;
+      _syncMoving(_status);
       _msg = 'Connected ${_ble.device?.platformName ?? ''}';
       _syncFromBoard();
     }
+  }
+
+  void _syncMoving(WingsStatus? s) {
+    _moving.value = s != null && (s.pathActive || s.seq);
   }
 
   /// Pause KWS while path/seq is active. BLE and the earpiece stay connected.
@@ -252,6 +268,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         _lastId = d.remoteId.str;
         _ready = _ble.isReady;
         _status = _ble.lastStatus;
+        _syncMoving(_status);
         final sp = _ble.lastStatus?.speedPct ?? 10;
         if (sp >= 1 && sp <= 100) _speedPct = sp;
         _msg = 'Connected ${d.platformName}';
@@ -272,6 +289,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     setState(() {
       _ready = false;
       _status = null;
+      _moving.value = false;
       _posesFromBoard = false;
       _msg = 'Disconnected';
     });
@@ -548,7 +566,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
           borderRadius: BorderRadius.circular(12),
         ),
         child: const Text(
-          'ALWAYS LISTEN — say Valkyrie then a command',
+          'ALWAYS LISTEN — Valkyrie open, or Valkyrie then a command',
           style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
         ),
       );
@@ -608,15 +626,21 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         const SizedBox(height: 8),
         _pairCard(s),
         const SizedBox(height: 8),
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: [
-            _armChip(s),
-            _chip(WingPose.name(s?.pose ?? 0), Colors.cyan),
-            if (s?.pathActive == true) _chip('MOVING', Colors.orange),
-            _chip('$_speedPct%', Colors.amber),
-          ],
+        ValueListenableBuilder<bool>(
+          valueListenable: _moving,
+          builder: (context, moving, _) {
+            final s = _status;
+            return Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _armChip(s),
+                _chip(WingPose.name(s?.pose ?? 0), Colors.cyan),
+                if (moving) _chip('MOVING', Colors.orange),
+                _chip('$_speedPct%', Colors.amber),
+              ],
+            );
+          },
         ),
         const SizedBox(height: 12),
         _speedOverride(),
