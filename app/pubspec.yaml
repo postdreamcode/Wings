@@ -1,7 +1,7 @@
 name: wings_app
 description: Wings ESP32 BLE controller — sideload APK
 publish_to: "none"
-version: 1.1.36+38
+version: 1.1.37+39
 
 environment:
   sdk: ^3.13.0

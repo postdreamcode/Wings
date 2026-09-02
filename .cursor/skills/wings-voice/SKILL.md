@@ -12,13 +12,13 @@ Hands-free should feel like a headset assistant: **Valkyrie** (chime) → short 
 
 ## Architecture (do not flatten)
 
-1. **Two KWS streams, always fed.** Wake-only stream and command-only stream both see every mic chunk. Do not rebuild/switch streams on Valkyrie — that stalls the audio thread and drops "open". Ignore command hits until the wake window is open.
+1. **Two KWS streams, always fed.** Wake stream is `HEY VALKYRIE` / `VALKYRIE`. Command stream is one-shot `VALKYRIE OPEN` (`@v_*`) plus short `OPEN` (`@c_*`). Always decode both. Ignore short `@c_*` until the wake window. One-shots fire without a prior wake (speaker still gated). Do not reset the command stream on Valkyrie.
 2. **Never run CampPlus on the mic callback.** Speaker lock is on wake, async after a yield. Command cosine is display-only. Blocking embed on PCM is why it felt seconds-late. HFP/earpiece cosine is often 0.30–0.45; keep threshold around **0.35**, not 0.50. More enroll clips help a little; a bigger KWS model does not fix speaker score.
 3. **Always-listen must not sit behind `_ptt`.** Hide PTT while always-listen (enroll still holds). `startAlways` clears `_ptt`.
 4. **Mute KWS while the wings move.** `pathActive` / `seq` → `pauseListen` (drop decode only). Keep AudioRecord + SCO up. Never `setCommunicationDevice` or `MODE_IN_COMMUNICATION`.
 5. **Idle radio:** BLE `lowPower` only after a move finishes. On a voice/RUN command, write GATT immediately (`withoutResponse`) and bump to `high` in parallel — never await `requestConnectionPriority` before the write. Do not request lowPower on every status notify.
 6. **Earpiece mic is HFP/SCO.** A2DP cannot record. Start SCO with the mic, `AudioRecord.setPreferredDevice(TYPE_BLUETOOTH_SCO)`. Stop SCO only when listening fully stops. Chimes: `USAGE_VOICE_COMMUNICATION` while SCO is up, else `USAGE_MEDIA`. Voice tab shows **MIC:** — if it says PHONE, the bud is not the capture device. Enroll with that line showing the headset.
-7. **keywords.txt** is BPE + `:boost #threshold @alias` (no space after `:`/`#`). Force-copy on launch. Do not put `VALKYRIE OPEN` in the same beam as `@wake`. Feed the command KWS stream only in the wake window.
+7. **keywords.txt** is BPE + `:boost #threshold @alias`. Wake: `HEY VALKYRIE` + `VALKYRIE`. One-shot `@v_open` etc. (`VALKYRIE OPEN`) stay armed always. Short `@c_open` only after wake. Do not reset the command stream on Valkyrie — that drops “open” in the same breath. Always feed both KWS streams.
 
 ## Enroll
 

@@ -2,7 +2,7 @@
 library;
 
 const int kProtocolVersion = 2;
-const String kAppVersion = '1.1.36';
+const String kAppVersion = '1.1.37';
 
 /// This pair's Slave WiFi/ESP-NOW MAC. LINK uses it when Master has never heard
 /// a hello (phone on Master is often RX-deaf).
