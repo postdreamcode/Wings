@@ -5,6 +5,28 @@ class WingsNative {
   static const _ch = MethodChannel('wings/native');
   static const mic = EventChannel('wings/mic');
 
+  WingsNative() {
+    _ch.setMethodCallHandler(_onNative);
+  }
+
+  void Function()? onParked;
+  void Function()? onDisconnect;
+  void Function()? onResumeListen;
+
+  Future<dynamic> _onNative(MethodCall call) async {
+    switch (call.method) {
+      case 'parked':
+        onParked?.call();
+        return;
+      case 'disconnect':
+        onDisconnect?.call();
+        return;
+      case 'resumeListen':
+        onResumeListen?.call();
+        return;
+    }
+  }
+
   Future<String> dataDir() async {
     return await _ch.invokeMethod<String>('dataDir') ?? '';
   }
@@ -61,5 +83,10 @@ class WingsNative {
   /// Active capture path: headset product name, `headset`, or `phone`.
   Future<String> micRoute() async {
     return await _ch.invokeMethod<String>('micRoute') ?? 'phone';
+  }
+
+  /// Stop AudioRecord, force-stop SCO, stop microphone FGS.
+  Future<void> park() async {
+    await _ch.invokeMethod('park');
   }
 }

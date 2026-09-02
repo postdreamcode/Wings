@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -12,6 +13,8 @@ import android.media.MediaRecorder
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
+import android.util.Log
 import io.flutter.plugin.common.EventChannel
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -20,15 +23,55 @@ import java.util.concurrent.TimeUnit
  * 16 kHz mono PCM16. A2DP cannot record — the earpiece mic is HFP/SCO only.
  * Start SCO with the recorder and pin AudioRecord to that input.
  * Do not setCommunicationDevice / MODE_IN_COMMUNICATION (disconnects buds).
- * Stop SCO only when the EventChannel is cancelled, not on chime or motion.
+ * Stop SCO only when listening fully stops (park / EventChannel cancel),
+ * not on chime or motion.
  */
 class WingsMic(private val ctx: Context) : EventChannel.StreamHandler {
     companion object {
+        private const val TAG = "WingsMic"
+
         @Volatile
         var route: String = "phone"
 
         @Volatile
         var scoUp: Boolean = false
+
+        @Volatile
+        private var live: WingsMic? = null
+
+        @Volatile
+        private var boundName: String = ""
+
+        @Volatile
+        private var boundId: Int = -1
+
+        /** Idempotent. Safe if the EventChannel never got onCancel (process death). */
+        fun releaseCapture(app: Context) {
+            live?.shutdown()
+            forceStopSco(app)
+            route = "phone"
+            scoUp = false
+            boundName = ""
+            boundId = -1
+        }
+
+        fun forceStopSco(app: Context) {
+            try {
+                val am = app.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                am.isBluetoothScoOn = false
+                am.stopBluetoothSco()
+            } catch (_: Exception) {
+            }
+        }
+
+        private fun isBtAudio(t: Int): Boolean {
+            if (t == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) return true
+            if (t == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP) return true
+            if (Build.VERSION.SDK_INT >= 31 && t == AudioDeviceInfo.TYPE_BLE_HEADSET) {
+                return true
+            }
+            return false
+        }
     }
 
     private var rec: AudioRecord? = null
@@ -37,8 +80,16 @@ class WingsMic(private val ctx: Context) : EventChannel.StreamHandler {
     private var scoReceiver: BroadcastReceiver? = null
     private var pcmThread: HandlerThread? = null
     private var pcmHandler: Handler? = null
+    private var deviceCb: AudioDeviceCallback? = null
+    private val main = Handler(Looper.getMainLooper())
+    private val shutLock = Any()
+    @Volatile
+    private var down = false
 
     override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+        shutdown()
+        down = false
+        live = this
         sink = events
         val app = ctx.applicationContext
         val ht = HandlerThread("wings-mic-pcm")
@@ -49,6 +100,7 @@ class WingsMic(private val ctx: Context) : EventChannel.StreamHandler {
         thread = Thread {
             val am = app.getSystemService(Context.AUDIO_SERVICE) as AudioManager
             startSco(app, am)
+            if (down) return@Thread
             val sr = 16000
             val min = AudioRecord.getMinBufferSize(
                 sr,
@@ -81,9 +133,10 @@ class WingsMic(private val ctx: Context) : EventChannel.StreamHandler {
                 } catch (_: Exception) {
                 }
             }
-            if (r == null) return@Thread
+            if (r == null || down) return@Thread
             rec = r
             bindHeadsetInput(am, r)
+            watchDevices(app, am)
             try {
                 r.startRecording()
             } catch (_: Exception) {
@@ -93,9 +146,10 @@ class WingsMic(private val ctx: Context) : EventChannel.StreamHandler {
             } catch (_: InterruptedException) {
                 return@Thread
             }
+            if (down) return@Thread
             bindHeadsetInput(am, r)
             val chunk = ByteArray(frameBytes)
-            while (!Thread.currentThread().isInterrupted) {
+            while (!Thread.currentThread().isInterrupted && !down) {
                 val n = try {
                     r.read(chunk, 0, chunk.size)
                 } catch (_: Exception) {
@@ -110,22 +164,33 @@ class WingsMic(private val ctx: Context) : EventChannel.StreamHandler {
     }
 
     override fun onCancel(arguments: Any?) {
-        thread?.interrupt()
-        thread = null
-        pcmHandler?.removeCallbacksAndMessages(null)
-        pcmThread?.quitSafely()
-        pcmHandler = null
-        pcmThread = null
-        try {
-            rec?.stop()
-        } catch (_: Exception) {
+        shutdown()
+    }
+
+    fun shutdown() {
+        synchronized(shutLock) {
+            if (down && rec == null && thread == null) return
+            down = true
+            if (live === this) live = null
+            thread?.interrupt()
+            thread = null
+            pcmHandler?.removeCallbacksAndMessages(null)
+            pcmThread?.quitSafely()
+            pcmHandler = null
+            pcmThread = null
+            try {
+                rec?.stop()
+            } catch (_: Exception) {
+            }
+            rec?.release()
+            rec = null
+            sink = null
+            unwatchDevices()
+            stopSco(ctx.applicationContext)
+            forceStopSco(ctx.applicationContext)
+            route = "phone"
+            scoUp = false
         }
-        rec?.release()
-        rec = null
-        sink = null
-        stopSco(ctx.applicationContext)
-        route = "phone"
-        scoUp = false
     }
 
     private fun startSco(app: Context, am: AudioManager) {
@@ -165,11 +230,71 @@ class WingsMic(private val ctx: Context) : EventChannel.StreamHandler {
         scoReceiver = null
         try {
             val am = app.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            if (am.isBluetoothScoOn) {
-                am.isBluetoothScoOn = false
-                am.stopBluetoothSco()
+            am.isBluetoothScoOn = false
+            am.stopBluetoothSco()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun watchDevices(app: Context, am: AudioManager) {
+        if (Build.VERSION.SDK_INT < 23) return
+        val cb = object : AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>) {
+                maybeParkNewBt(am, added)
+            }
+
+            override fun onAudioDevicesRemoved(removed: Array<out AudioDeviceInfo>) {
+                val id = boundId
+                if (id < 0) return
+                if (removed.any { it.id == id }) {
+                    Log.i(TAG, "auto-park: bound SCO gone id=$id name=$boundName")
+                    WingsPark.park(app, keepBle = true, tellDart = true)
+                }
+            }
+        }
+        deviceCb = cb
+        try {
+            am.registerAudioDeviceCallback(cb, main)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun unwatchDevices() {
+        val cb = deviceCb ?: return
+        deviceCb = null
+        try {
+            val am = ctx.applicationContext
+                .getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            if (Build.VERSION.SDK_INT >= 23) {
+                am.unregisterAudioDeviceCallback(cb)
             }
         } catch (_: Exception) {
+        }
+    }
+
+    private fun maybeParkNewBt(am: AudioManager, added: Array<out AudioDeviceInfo>) {
+        val saved = boundName
+        if (saved.isEmpty() || down) return
+        for (d in added) {
+            if (!isBtAudio(d.type)) continue
+            val name = d.productName?.toString()?.trim().orEmpty()
+            if (name.isEmpty()) continue
+            if (name.equals(saved, ignoreCase = true)) continue
+            Log.i(TAG, "auto-park: new BT audio '$name' (saved headset '$saved')")
+            WingsPark.park(ctx.applicationContext, keepBle = true, tellDart = true)
+            return
+        }
+        if (Build.VERSION.SDK_INT >= 31) {
+            val comm = try {
+                am.communicationDevice
+            } catch (_: Exception) {
+                null
+            } ?: return
+            if (!isBtAudio(comm.type)) return
+            val name = comm.productName?.toString()?.trim().orEmpty()
+            if (name.isEmpty() || name.equals(saved, ignoreCase = true)) return
+            Log.i(TAG, "auto-park: comm device '$name' (saved headset '$saved')")
+            WingsPark.park(ctx.applicationContext, keepBle = true, tellDart = true)
         }
     }
 
@@ -192,6 +317,8 @@ class WingsMic(private val ctx: Context) : EventChannel.StreamHandler {
             }
             val name = pick.productName?.toString()?.trim().orEmpty()
             route = if (name.isEmpty()) "headset" else name
+            boundName = route
+            boundId = pick.id
             scoUp = pick.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
                 (Build.VERSION.SDK_INT >= 31 && pick.type == AudioDeviceInfo.TYPE_BLE_HEADSET)
         } else {

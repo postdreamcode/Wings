@@ -20,8 +20,9 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         EventChannel(flutterEngine.dartExecutor.binaryMessenger, "wings/mic")
             .setStreamHandler(WingsMic(this))
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
-            .setMethodCallHandler { call, result ->
+        val ch = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
+        WingsPark.dartChannel = ch
+        ch.setMethodCallHandler { call, result ->
                 when (call.method) {
                     "dataDir" -> {
                         result.success(filesDir.absolutePath)
@@ -90,9 +91,34 @@ class MainActivity : FlutterActivity() {
                     "micRoute" -> {
                         result.success(WingsMic.route)
                     }
+                    "park" -> {
+                        WingsPark.park(applicationContext, keepBle = false, tellDart = false)
+                        result.success(null)
+                    }
                     else -> result.notImplemented()
                 }
             }
+        maybeResume(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        maybeResume(intent)
+    }
+
+    override fun onDestroy() {
+        if (WingsPark.dartChannel != null) {
+            // Channel dies with the engine; Recents swipe parks from the FGS.
+            WingsPark.dartChannel = null
+        }
+        super.onDestroy()
+    }
+
+    private fun maybeResume(intent: Intent?) {
+        if (intent?.action == WingsPark.ACTION_RESUME) {
+            WingsPark.tell("resumeListen")
+        }
     }
 
     private fun isIgnoringBattery(): Boolean {

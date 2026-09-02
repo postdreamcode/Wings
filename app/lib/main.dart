@@ -89,13 +89,16 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
           (v.enrolled || v.store?.debugBypass == true);
       _onVoiceHeard(hit, fire: live);
     };
-    v.init().then((_) async {
-      if (!mounted) return;
-      if (v.store?.live == true && v.store?.alwaysListen == true) {
-        await Permission.microphone.request();
-        await v.startAlways();
-      }
-    });
+    _native.onParked = () {
+      unawaited(_onNativeParked());
+    };
+    _native.onDisconnect = () {
+      unawaited(_disconnect());
+    };
+    _native.onResumeListen = () {
+      unawaited(_resumeListening());
+    };
+    v.init();
   }
 
   @override
@@ -281,7 +284,39 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     }
   }
 
+  Future<void> _onNativeParked() async {
+    await WingsSession.instance.voice.stopAlways(nativePark: false);
+    if (!mounted) return;
+    setState(() => _msg = 'Parked — earpiece radio released');
+  }
+
+  Future<void> _parkSession() async {
+    await WingsSession.instance.voice.stopAlways(nativePark: true);
+    if (_ble.holdingLink) {
+      try {
+        await _native.startFg('Wings connected', mic: false);
+      } catch (_) {}
+    }
+    if (!mounted) return;
+    setState(() => _msg = 'Parked — earpiece radio released');
+  }
+
+  Future<void> _resumeListening() async {
+    if (!mounted) return;
+    final v = WingsSession.instance.voice;
+    await v.init();
+    final st = v.store;
+    if (st == null || !st.live || !st.alwaysListen) return;
+    await Permission.microphone.request();
+    await v.startAlways();
+    try {
+      await _native.startFg('Wings listening', mic: true);
+    } catch (_) {}
+    if (mounted) setState(() => _msg = 'Listening');
+  }
+
   Future<void> _disconnect() async {
+    await WingsSession.instance.voice.stopAlways(nativePark: true);
     try {
       await _native.stopFg();
     } catch (_) {}
@@ -555,23 +590,63 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
   bool _runPttDown = false;
 
+  Widget _parkOrResume() {
+    final v = WingsSession.instance.voice;
+    return ValueListenableBuilder<bool>(
+      valueListenable: v.armed,
+      builder: (context, armed, _) {
+        final st = v.store;
+        final canResume = !armed &&
+            st?.live == true &&
+            st?.alwaysListen == true;
+        if (armed) {
+          return SizedBox(
+            height: 56,
+            width: double.infinity,
+            child: FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: Colors.orange.shade800,
+              ),
+              onPressed: _parkSession,
+              child: const Text('PARK — release earpiece / car radio'),
+            ),
+          );
+        }
+        if (canResume) {
+          return SizedBox(
+            height: 56,
+            width: double.infinity,
+            child: FilledButton.tonal(
+              onPressed: _resumeListening,
+              child: const Text('RESUME LISTENING'),
+            ),
+          );
+        }
+        return const SizedBox.shrink();
+      },
+    );
+  }
+
   Widget _runPtt() {
-    if (WingsSession.instance.voice.isAlways) {
-      return Container(
-        height: 56,
-        width: double.infinity,
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: Colors.green.shade900,
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: const Text(
-          'ALWAYS LISTEN — Valkyrie open, or Valkyrie then a command',
-          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-        ),
-      );
-    }
-    return Listener(
+    return ValueListenableBuilder<bool>(
+      valueListenable: WingsSession.instance.voice.armed,
+      builder: (context, armed, _) {
+        if (armed) {
+          return Container(
+            height: 56,
+            width: double.infinity,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: Colors.green.shade900,
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: const Text(
+              'ALWAYS LISTEN — Valkyrie open, or Valkyrie then a command',
+              style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+            ),
+          );
+        }
+        return Listener(
       onPointerDown: (_) async {
         setState(() => _runPttDown = true);
         await Permission.microphone.request();
@@ -608,6 +683,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
           ),
         ),
       ),
+    );
+      },
     );
   }
 
@@ -700,6 +777,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
             child: const Text('STOP'),
           ),
         ),
+        const SizedBox(height: 8),
+        _parkOrResume(),
         const SizedBox(height: 8),
         _runPtt(),
         const SizedBox(height: 24),

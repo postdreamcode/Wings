@@ -163,6 +163,7 @@ class WingsVoice {
   bool get isPtt => _ptt;
   bool get listenPaused => _listenPaused;
   bool _listenPaused = false;
+  final armed = ValueNotifier<bool>(false);
 
   Future<void> startAlways() async {
     if (!ready || _spotter == null) return;
@@ -176,15 +177,23 @@ class WingsVoice {
     _cmdUntil = null;
     _spkPending = false;
     _disarmCmdWatch();
+    armed.value = true;
     await _ensureMic();
   }
 
-  Future<void> stopAlways() async {
+  /// Stop the listen session. Does not clear [VoiceStore.alwaysListen].
+  Future<void> stopAlways({bool nativePark = true}) async {
     _always = false;
     _listenPaused = false;
     _cmdUntil = null;
     _disarmCmdWatch();
+    armed.value = false;
     if (!_ptt) await _stopMic(commit: false);
+    if (nativePark) {
+      try {
+        await _native.park();
+      } catch (_) {}
+    }
   }
 
   /// Mute KWS while servos run. Keep the headset mic/SCO up. No-op if not always-listen.

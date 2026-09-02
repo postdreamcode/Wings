@@ -228,48 +228,53 @@ class _VoicePageState extends State<VoicePage> {
         const SizedBox(height: 8),
         Text(_msg, style: const TextStyle(color: Colors.white70)),
         const SizedBox(height: 12),
-        if (_voice.isAlways && !_enrolling)
-          Container(
-            height: 72,
-            alignment: Alignment.center,
-            decoration: BoxDecoration(
-              color: Colors.green.shade900,
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: const Text(
-              'HANDS-FREE — Valkyrie open, or Valkyrie then open',
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
-                color: Colors.white,
-              ),
-            ),
-          )
-        else
-          Listener(
-            onPointerDown: (_) => _down(),
-            onPointerUp: (_) => _up(),
-            onPointerCancel: (_) => _up(),
-            child: Container(
-              height: 72,
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: _holding ? Colors.red : Colors.cyan.shade800,
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Text(
-                _holding
-                    ? 'RELEASE'
-                    : (_enrolling ? 'HOLD TO RECORD' : 'HOLD TO TALK'),
-                style: const TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white,
+        ValueListenableBuilder<bool>(
+          valueListenable: _voice.armed,
+          builder: (context, armed, _) {
+            if (armed && !_enrolling) {
+              return Container(
+                height: 72,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: Colors.green.shade900,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: const Text(
+                  'HANDS-FREE — Valkyrie open, or Valkyrie then open',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+              );
+            }
+            return Listener(
+              onPointerDown: (_) => _down(),
+              onPointerUp: (_) => _up(),
+              onPointerCancel: (_) => _up(),
+              child: Container(
+                height: 72,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: _holding ? Colors.red : Colors.cyan.shade800,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  _holding
+                      ? 'RELEASE'
+                      : (_enrolling ? 'HOLD TO RECORD' : 'HOLD TO TALK'),
+                  style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
                 ),
               ),
-            ),
-          ),
+            );
+          },
+        ),
         const SizedBox(height: 8),
         TextButton(
           onPressed: () async {
@@ -306,8 +311,10 @@ class _VoicePageState extends State<VoicePage> {
                     }
                   } else {
                     await _voice.stopAlways();
-                    await WingsSession.instance.native
-                        .updateFg('Wings connected');
+                    if (WingsSession.instance.ble.holdingLink) {
+                      await WingsSession.instance.native
+                          .startFg('Wings connected', mic: false);
+                    }
                   }
                   setState(() {});
                 },
