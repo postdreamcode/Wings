@@ -54,6 +54,7 @@ class _VoicePageState extends State<VoicePage> {
 
   @override
   void dispose() {
+    if (_enrolling) _voice.holdMic(false);
     _name.dispose();
     super.dispose();
   }
@@ -64,16 +65,24 @@ class _VoicePageState extends State<VoicePage> {
     if (mounted) setState(() {});
   }
 
-  Future<bool> _headsetOrRefuse() async {
-    final r = await _voice.waitMicRoute();
+  Future<bool> _headsetOrRefuse({bool keepMic = false}) async {
+    final r = _voice.isCapturing
+        ? await _voice.peekMicRoute()
+        : await _voice.waitMicRoute();
     final phone = r.trim().toLowerCase() == 'phone';
-    await _voice.dropMicIfIdle();
     if (phone) {
+      _voice.holdMic(false);
+      await _voice.dropMicIfIdle();
       if (mounted) {
         setState(() => _msg =
             'MIC: PHONE (earpiece not captured — reconnect the bud, then Retrain)');
       }
       return false;
+    }
+    if (keepMic) {
+      // Caller (enroll / startAlways) owns the recorder.
+    } else if (!_voice.isAlways) {
+      await _voice.dropMicIfIdle();
     }
     return true;
   }
@@ -105,6 +114,7 @@ class _VoicePageState extends State<VoicePage> {
         if (_voice.isPhoneMic) {
           _msg =
               'MIC: PHONE (earpiece not captured — reconnect the bud, then Retrain)';
+          _voice.holdMic(false);
           if (mounted) setState(() {});
           return;
         }
@@ -133,6 +143,7 @@ class _VoicePageState extends State<VoicePage> {
           _enrollI = 0;
           _clips.clear();
           _voice.setCue(true);
+          _voice.holdMic(false);
         } else {
           _msg =
               'Saved ${_clips.length}. Next: ${_prompts[_enrollI]} '
@@ -296,7 +307,10 @@ class _VoicePageState extends State<VoicePage> {
           onChanged: (st == null || (!_voice.enrolled && !(st.debugBypass)))
               ? null
               : (v) async {
-                  if (v && !await _headsetOrRefuse()) return;
+                  if (v &&
+                      !await _headsetOrRefuse(keepMic: st.alwaysListen)) {
+                    return;
+                  }
                   st.live = v;
                   await st.save();
                   if (v) {
@@ -331,7 +345,7 @@ class _VoicePageState extends State<VoicePage> {
           onChanged: (st == null || !st.live)
               ? null
               : (v) async {
-                  if (v && !await _headsetOrRefuse()) return;
+                  if (v && !await _headsetOrRefuse(keepMic: true)) return;
                   st.alwaysListen = v;
                   await st.save();
                   if (v) {
@@ -375,7 +389,8 @@ class _VoicePageState extends State<VoicePage> {
               children: [
                 TextButton(
                   onPressed: () async {
-                    if (!await _headsetOrRefuse()) return;
+                    if (!await _headsetOrRefuse(keepMic: true)) return;
+                    _voice.holdMic(true);
                     _name.text = p.name;
                     setState(() {
                       _enrolling = true;
@@ -413,7 +428,8 @@ class _VoicePageState extends State<VoicePage> {
                   setState(() => _msg = 'Name the profile first.');
                   return;
                 }
-                if (!await _headsetOrRefuse()) return;
+                if (!await _headsetOrRefuse(keepMic: true)) return;
+                _voice.holdMic(true);
                 setState(() {
                   _enrolling = true;
                   _enrollI = 0;

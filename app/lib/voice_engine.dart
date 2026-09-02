@@ -162,7 +162,9 @@ class WingsVoice {
   bool get isAlways => _always;
   bool get isPtt => _ptt;
   bool get listenPaused => _listenPaused;
+  bool get isCapturing => _micSub != null;
   bool _listenPaused = false;
+  bool _holdMic = false;
   final armed = ValueNotifier<bool>(false);
 
   Future<void> startAlways() async {
@@ -188,6 +190,7 @@ class WingsVoice {
     _cmdUntil = null;
     _disarmCmdWatch();
     armed.value = false;
+    _holdMic = false;
     if (!_ptt) await _stopMic(commit: false);
     if (nativePark) {
       try {
@@ -242,8 +245,15 @@ class WingsVoice {
 
   /// Stop capture if we only started it to read MIC route.
   Future<void> dropMicIfIdle() async {
-    if (_always || _ptt) return;
+    if (_always || _ptt || _holdMic) return;
     await _stopMic(commit: false);
+  }
+
+  void holdMic(bool on) {
+    _holdMic = on;
+    if (!on && !_always && !_ptt) {
+      unawaited(dropMicIfIdle());
+    }
   }
 
   void _ping(String kind) {
@@ -392,38 +402,41 @@ class WingsVoice {
   }
 
   void _onPcm(dynamic raw) {
-    if (_listenPaused && !_ptt) return;
-    if (_kwsDuckUntil != null && DateTime.now().isBefore(_kwsDuckUntil!)) {
-      return;
-    }
-    final bytes = raw is Uint8List ? raw : Uint8List.fromList(List<int>.from(raw as List));
-    final n = bytes.length ~/ 2;
-    final f = Float32List(n);
-    final bd = ByteData.sublistView(bytes);
-    for (var i = 0; i < n; i++) {
-      f[i] = bd.getInt16(i * 2, Endian.little) / 32768.0;
-    }
-    _pushRing(f);
-    if (_ptt) _pcm.addAll(f);
-    final spot = _spotter;
-    if (spot == null) return;
-    final wake = _wakeStream;
-    final cmd = _cmdStream;
-    if (wake != null) _feed(spot, wake, f, wakeSide: true);
-    if (cmd != null) _feed(spot, cmd, f, wakeSide: false);
-    if (_always && !_ptt && _heard.isNotEmpty) {
-      if (_spkPending) return;
-      if (_oneshot) {
-        _spkPending = true;
-        unawaited(_verifyOneshot());
+    try {
+      if (_listenPaused && !_ptt) return;
+      if (_kwsDuckUntil != null && DateTime.now().isBefore(_kwsDuckUntil!)) {
         return;
       }
-      if (_wake || _cmdOpen) {
-        _emitAlways();
-      } else {
-        _heard = '';
+      final bytes = raw is Uint8List ? raw : Uint8List.fromList(List<int>.from(raw as List));
+      final n = bytes.length ~/ 2;
+      if (n < 1) return;
+      final f = Float32List(n);
+      final bd = ByteData.sublistView(bytes);
+      for (var i = 0; i < n; i++) {
+        f[i] = bd.getInt16(i * 2, Endian.little) / 32768.0;
       }
-    }
+      _pushRing(f);
+      if (_ptt) _pcm.addAll(f);
+      final spot = _spotter;
+      if (spot == null) return;
+      final wake = _wakeStream;
+      final cmd = _cmdStream;
+      if (wake != null) _feed(spot, wake, f, wakeSide: true);
+      if (cmd != null) _feed(spot, cmd, f, wakeSide: false);
+      if (_always && !_ptt && _heard.isNotEmpty) {
+        if (_spkPending) return;
+        if (_oneshot) {
+          _spkPending = true;
+          unawaited(_verifyOneshot());
+          return;
+        }
+        if (_wake || _cmdOpen) {
+          _emitAlways();
+        } else {
+          _heard = '';
+        }
+      }
+    } catch (_) {}
   }
 
   void _noteKw(String kw) {
@@ -698,7 +711,8 @@ class WingsVoice {
   Future<VoiceHit?> stopPtt({bool commit = true}) async {
     // Keep _ptt armed through the end-of-utterance flush. KWS often fires
     // on the trailing silence, after the finger is already up.
-    if (_always) {
+    // Enroll holds the same recorder across clips — do not bounce SCO.
+    if (_always || _holdMic) {
       if (!commit) {
         _ptt = false;
         return null;

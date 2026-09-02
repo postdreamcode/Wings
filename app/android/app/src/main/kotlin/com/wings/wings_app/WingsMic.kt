@@ -64,6 +64,18 @@ class WingsMic(private val ctx: Context) : EventChannel.StreamHandler {
             }
         }
 
+        private fun isHeadsetAlias(saved: String, name: String): Boolean {
+            val a = saved.trim()
+            val b = name.trim()
+            if (a.isEmpty() || b.isEmpty()) return false
+            val al = a.lowercase()
+            val bl = b.lowercase()
+            if (al == bl) return true
+            // Own SCO/A2DP alias: "Buds2" vs "Galaxy Buds2 Pro" / "Buds2 Pro LE"
+            if (bl.startsWith(al) || al.startsWith(bl)) return true
+            return false
+        }
+
         private fun isBtAudio(t: Int): Boolean {
             if (t == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) return true
             if (t == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP) return true
@@ -157,7 +169,17 @@ class WingsMic(private val ctx: Context) : EventChannel.StreamHandler {
                 }
                 if (n > 0) {
                     val copy = chunk.copyOf(n)
-                    pcmH.post { sink?.success(copy) }
+                    pcmH.post {
+                        if (down || sink == null) return@post
+                        main.post {
+                            if (down) return@post
+                            val s = sink ?: return@post
+                            try {
+                                s.success(copy)
+                            } catch (_: Exception) {
+                            }
+                        }
+                    }
                 }
             }
         }.also { it.start() }
@@ -279,7 +301,7 @@ class WingsMic(private val ctx: Context) : EventChannel.StreamHandler {
             if (!isBtAudio(d.type)) continue
             val name = d.productName?.toString()?.trim().orEmpty()
             if (name.isEmpty()) continue
-            if (name.equals(saved, ignoreCase = true)) continue
+            if (isHeadsetAlias(saved, name)) continue
             Log.i(TAG, "auto-park: new BT audio '$name' (saved headset '$saved')")
             WingsPark.park(ctx.applicationContext, keepBle = true, tellDart = true)
             return
@@ -292,7 +314,7 @@ class WingsMic(private val ctx: Context) : EventChannel.StreamHandler {
             } ?: return
             if (!isBtAudio(comm.type)) return
             val name = comm.productName?.toString()?.trim().orEmpty()
-            if (name.isEmpty() || name.equals(saved, ignoreCase = true)) return
+            if (name.isEmpty() || isHeadsetAlias(saved, name)) return
             Log.i(TAG, "auto-park: comm device '$name' (saved headset '$saved')")
             WingsPark.park(ctx.applicationContext, keepBle = true, tellDart = true)
         }
