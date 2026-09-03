@@ -120,9 +120,12 @@ class _VoicePageState extends State<VoicePage> {
         }
         final emb = await _voice.enrollClip();
         if (emb == null) {
-          _msg =
-              'Too short — keep holding about a second. Still: ${_prompts[_enrollI]} '
-              '(${_enrollI + 1}/${_prompts.length}, ${_clips.length} saved)';
+          final ms = _voice.lastEnrollMs;
+          _msg = _voice.lastEnrollFail == 'embed'
+              ? 'Didn\'t lock that clip — say it as you press, then release (~1s). Still: ${_prompts[_enrollI]} '
+                  '(${_enrollI + 1}/${_prompts.length}, ${_clips.length} saved)'
+              : 'Too short — captured ${ms}ms (need ~700). Still: ${_prompts[_enrollI]} '
+                  '(${_enrollI + 1}/${_prompts.length}, ${_clips.length} saved)';
           if (mounted) setState(() {});
           return;
         }
@@ -377,7 +380,9 @@ class _VoicePageState extends State<VoicePage> {
         const SizedBox(height: 4),
         const Text(
           'Retrain with the earpiece in and the phone away from your mouth. '
-          'The MIC line above must show the headset, not PHONE.',
+          'The MIC line above must show the headset, not PHONE. '
+          'Say the prompt as you press, then release — about one second. '
+          'Holding after the word does not help.',
           style: TextStyle(color: Colors.white70, fontSize: 13),
         ),
         for (final p in st?.profiles ?? [])

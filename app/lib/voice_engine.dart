@@ -58,8 +58,12 @@ class WingsVoice {
   static const _minWakeSpeech = 9600; // 0.6 s
   static const _maxWakeSpeech = 16000; // 1.0 s
   static const _minEnrollSpeech = 11200; // 0.7 s
+  static const _enrollFloor = 1e-6; // HFP/earpiece is quieter than 4e-5
   DateTime? _kwsDuckUntil;
   Float32List? _spkClip;
+  int _pttRingI = 0;
+  int lastEnrollMs = 0;
+  String lastEnrollFail = '';
   final lastKw = ValueNotifier<String>('');
   final micRoute = ValueNotifier<String>('');
   static const _ringN = 32000; // 2s @ 16 kHz
@@ -220,6 +224,7 @@ class WingsVoice {
     _ptt = true;
     _cue = cue;
     _pcm.clear();
+    _pttRingI = _ringI;
     _heard = '';
     _wake = false;
     _cmdUntil = null;
@@ -404,9 +409,6 @@ class WingsVoice {
   void _onPcm(dynamic raw) {
     try {
       if (_listenPaused && !_ptt) return;
-      if (_kwsDuckUntil != null && DateTime.now().isBefore(_kwsDuckUntil!)) {
-        return;
-      }
       final bytes = raw is Uint8List ? raw : Uint8List.fromList(List<int>.from(raw as List));
       final n = bytes.length ~/ 2;
       if (n < 1) return;
@@ -417,6 +419,12 @@ class WingsVoice {
       }
       _pushRing(f);
       if (_ptt) _pcm.addAll(f);
+      // Duck / enroll: still record. Only skip KWS so a chime or
+      // "Hey Valkyrie" prompt cannot starve the clip.
+      if (_kwsDuckUntil != null && DateTime.now().isBefore(_kwsDuckUntil!)) {
+        return;
+      }
+      if (_ptt && !_cue) return;
       final spot = _spotter;
       if (spot == null) return;
       final wake = _wakeStream;
@@ -522,7 +530,11 @@ class WingsVoice {
     return n;
   }
 
-  Float32List _vadTrim(Float32List pcm, {required bool fromStart}) {
+  Float32List _vadTrim(
+    Float32List pcm, {
+    required bool fromStart,
+    double floorMeanSq = 4e-5,
+  }) {
     if (pcm.isEmpty) return Float32List(0);
     final n = pcm.length;
     final frames = n ~/ _vadFrame;
@@ -539,7 +551,7 @@ class WingsVoice {
       energy[f] = e;
       if (e > maxE) maxE = e;
     }
-    final floor = _vadFrame * 4e-5;
+    final floor = _vadFrame * floorMeanSq;
     if (maxE < floor) return Float32List(0);
     final thr = max(maxE * 0.08, floor);
     var end = -1;
@@ -567,6 +579,27 @@ class WingsVoice {
     final out = Float32List(len);
     for (var i = 0; i < len; i++) {
       out[i] = pcm[a + i];
+    }
+    return out;
+  }
+
+  /// Samples captured during this PTT. Prefer `_pcm`; fall back to the ring
+  /// from press-down so a missed EventSink chunk does not empty the clip.
+  Float32List _holdPcm() {
+    if (_pcm.length >= _minEnrollSpeech) {
+      return Float32List.fromList(_pcm);
+    }
+    var take = (_ringI - _pttRingI + _ringN) % _ringN;
+    if (take == 0 && _ringLen == _ringN) take = _ringN;
+    if (take < _pcm.length) {
+      return Float32List.fromList(_pcm);
+    }
+    if (take < 1600) return Float32List.fromList(_pcm);
+    final out = Float32List(take);
+    var i = _pttRingI;
+    for (var k = 0; k < take; k++) {
+      out[k] = _ring[i];
+      i = (i + 1) % _ringN;
     }
     return out;
   }
@@ -809,17 +842,33 @@ class WingsVoice {
     return d == 0 ? 0 : dot / d;
   }
 
-  /// Campplus wants ~1s. Reject clips with under ~0.7s of real energy (zero-pad is not speech).
+  /// Campplus wants ~1s. HFP speech is often below the live 4e-5 floor
+  /// once SCO has settled — count samples, not that energy gate.
+  /// Take the start of the hold (the word). A long press of trailing
+  /// silence is why "holding longer" still failed.
   Future<Float32List?> enrollClip() async {
-    var pcm = List<double>.from(_pcm);
-    if (_energySamples(pcm) < _minEnrollSpeech) return null;
-    final trimmed = _vadTrim(Float32List.fromList(pcm), fromStart: true);
-    if (_energySamples(trimmed) < _minEnrollSpeech) return null;
-    pcm = trimmed.toList();
+    var pcm = _holdPcm().toList();
+    lastEnrollMs = pcm.length * 1000 ~/ 16000;
+    lastEnrollFail = '';
+    if (pcm.length < _minEnrollSpeech) {
+      lastEnrollFail = 'short';
+      return null;
+    }
+    final trimmed = _vadTrim(
+      Float32List.fromList(pcm),
+      fromStart: true,
+      floorMeanSq: _enrollFloor,
+    );
+    if (trimmed.length >= _minEnrollSpeech) {
+      pcm = trimmed.toList();
+    }
+    if (pcm.length > 16000) pcm = pcm.sublist(0, 16000);
     if (pcm.length < 16000) {
       pcm.addAll(List<double>.filled(16000 - pcm.length, 0.0));
     }
-    return _embed(pcm);
+    final emb = _embed(pcm);
+    if (emb == null) lastEnrollFail = 'embed';
+    return emb;
   }
 
   Future<bool> addProfile(String name, List<Float32List> embeds) async {
